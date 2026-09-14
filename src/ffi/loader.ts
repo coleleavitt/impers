@@ -521,6 +521,22 @@ function sanitizeArchivePath(name: string): string | null {
   return parts.join("/");
 }
 
+function verifyExtractionAncestorChain(targetRoot: string): void {
+  const absoluteRoot = resolve(targetRoot);
+  let current = absoluteRoot;
+  for (;;) {
+    if (existsSync(current)) {
+      const info = lstatSync(current);
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new Error(`Unsafe extraction ancestor: ${current}`);
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
 function ensureSafeDirectory(targetRoot: string, directory: string): void {
   if (!isContained(targetRoot, directory)) {
     throw new Error(`Extraction directory escapes root: ${directory}`);
@@ -573,6 +589,7 @@ export function writeExtractedEntries(
   platform: string
 ): void {
   const targetRoot = resolve(targetDir);
+  verifyExtractionAncestorChain(targetRoot);
   const prepared = entries.map((entry) => {
     const safePath = sanitizeArchivePath(entry.name);
     if (!safePath) {
@@ -687,7 +704,7 @@ export function pickAsset(
     : platform === "linux"
     ? ["linux"]
     : platform === "win32"
-    ? ["win", "windows"]
+    ? ["win32", "windows", "windows32"]
     : [platform];
   const platformExcludes = platform === "linux"
     ? ["android"]
@@ -902,19 +919,18 @@ function extractFromZip(buffer: Buffer): ExtractedEntry[] {
   return entries;
 }
 
-function isLibName(name: string, libPrefix: string, libExt: string): boolean {
-  const base = basename(name);
-  if (!base.startsWith(libPrefix)) {
-    return false;
-  }
+/** @internal Exported for canonical library-name regression tests. */
+export function isLibName(name: string, libPrefix: string, libExt: string): boolean {
+  const base = basename(name).toLowerCase();
+  const prefix = libPrefix.toLowerCase();
   if (libExt === ".so") {
-    return /\.so(?:\.\d+)*$/.test(base);
+    return new RegExp(`^${prefix}\\.so(?:\\.\\d+)*$`).test(base);
   }
   if (libExt === ".dylib") {
-    return /\.dylib$/.test(base);
+    return base === `${prefix}.dylib`;
   }
   if (libExt === ".dll") {
-    return /\.dll$/.test(base);
+    return base === `${prefix}.dll`;
   }
   return false;
 }

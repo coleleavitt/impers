@@ -2,6 +2,7 @@ import {
   LIBCURL_IMPERSONATE_RELEASE_URL,
   LIBCURL_IMPERSONATE_VERSION,
   pickAsset,
+  isLibName,
   resolveLibrary,
   writeExtractedEntries,
 } from "../src/ffi/loader.js";
@@ -191,12 +192,26 @@ describe("libcurl loader", () => {
     expect(pickAsset(assets, "linux", "x64")).toBeNull();
   });
 
+
+  it("selects the real pinned win32 x86_64 archive name", () => {
+    const asset = {
+      name: "libcurl-impersonate-v2.2.2.x86_64-win32.tar.gz",
+      browser_download_url: "https://example.invalid/win32.tar.gz",
+    };
+    expect(pickAsset([asset], "win32", "x64")).toEqual(asset);
+  });
+
   it("does not match win inside darwin", () => {
     const assets = [{
       name: "libcurl-impersonate-darwin-x86_64.zip",
       browser_download_url: "https://example.invalid/darwin.zip",
     }];
     expect(pickAsset(assets, "win32", "x64")).toBeNull();
+  });
+
+  it("rejects runtime probe sidecars as cached main libraries", () => {
+    expect(isLibName("libcurl-impersonate.runtime-probe.so", "libcurl-impersonate", ".so")).toBe(false);
+    expect(isLibName("libcurl-impersonate.so.4.8.0", "libcurl-impersonate", ".so")).toBe(true);
   });
 
   it.each([
@@ -255,6 +270,27 @@ describe("libcurl loader", () => {
     }
   });
 
+
+  it("rejects a symlink ancestor above the extraction root", () => {
+    const root = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    const outsideDir = join(root, "outside");
+    const link = join(root, "link");
+    const targetDir = join(link, "target");
+    mkdirSync(outsideDir);
+    symlinkSync(outsideDir, link, "dir");
+
+    try {
+      expect(() => writeExtractedEntries([{
+        name: "lib/libcurl-impersonate.so",
+        data: Buffer.from("must stay inside"),
+        type: "file",
+      }], targetDir, "linux")).toThrow(/Unsafe extraction ancestor/);
+      expect(existsSync(join(outsideDir, "target", "lib", "libcurl-impersonate.so"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a symlink extraction root", () => {
     const root = mkdtempSync(join(tmpdir(), "impers-loader-"));
     const outsideDir = join(root, "outside");
@@ -267,7 +303,7 @@ describe("libcurl loader", () => {
         name: "libcurl-impersonate.so",
         data: Buffer.from("must stay inside"),
         type: "file",
-      }], targetDir, "linux")).toThrow(/Unsafe extraction root/);
+      }], targetDir, "linux")).toThrow(/Unsafe extraction (?:root|ancestor)/);
       expect(existsSync(join(outsideDir, "libcurl-impersonate.so"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
