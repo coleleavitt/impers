@@ -11,6 +11,7 @@ import {
   curl_multi_add_handle,
   curl_multi_remove_handle,
   curl_multi_perform,
+  curl_multi_poll,
   curl_multi_cleanup,
   curl_multi_info_read,
   curl_ws_recv,
@@ -36,6 +37,9 @@ const MAX_CONTROL_FRAMES_PER_POLL = 100;
 
 /** Give a peer a short, bounded opportunity to complete a locally initiated close. */
 const CLOSE_SETTLE_MS = 250;
+
+/** Bound retries when libcurl cannot immediately write a WebSocket frame. */
+const SEND_TIMEOUT_MS = 30_000;
 
 const CLOSE_NO_STATUS = 1005;
 const CLOSE_ABNORMAL = 1006;
@@ -101,6 +105,7 @@ export class AsyncWebSocket {
   }>();
   private closing = false;
   private closePromise: Promise<void> | null = null;
+  private sendTail: Promise<void> = Promise.resolve();
 
   private maxMessageSize: number;
 
@@ -311,7 +316,7 @@ export class AsyncWebSocket {
    * Returns the message if available, null if CURLE_AGAIN
    * Throws on error
    */
-  private tryReceive(): WebSocketMessage | null {
+  private async tryReceive(): Promise<WebSocketMessage | null> {
     if (this._closed) return null;
 
     for (let controlFrames = 0; controlFrames < MAX_CONTROL_FRAMES_PER_POLL; controlFrames++) {
@@ -371,17 +376,17 @@ export class AsyncWebSocket {
 
       if (isControl) {
         if ((frameFlags & CurlWsFlag.CURLWS_CONT) !== 0 || data.length > 125) {
-          this.abortWithClose(CLOSE_PROTOCOL_ERROR, "Invalid control frame");
+          await this.abortWithClose(CLOSE_PROTOCOL_ERROR, "Invalid control frame");
           throw new WebSocketClosed(CLOSE_ABNORMAL, "Invalid control frame");
         }
         const message = this.frameToMessage(data, frameFlags);
         if (message?.type === WebSocketMessageType.CLOSE) {
-          this.handleCloseFrame(message.data);
+          await this.handleCloseFrame(message.data);
           throw new WebSocketClosed(this._closeEvent?.code ?? CLOSE_ABNORMAL, this._closeEvent?.reason ?? "");
         }
         if (message?.type === WebSocketMessageType.PING) {
           try {
-            this.sendPongNow(message.data);
+            await this.sendPongNow(message.data);
           } catch (error) {
             this.failConnection(error);
             throw error;
@@ -441,17 +446,17 @@ export class AsyncWebSocket {
   /**
    * Handle close frame
    */
-  private handleCloseFrame(data: Buffer): void {
+  private async handleCloseFrame(data: Buffer): Promise<void> {
     const parsed = this.parseClosePayload(data);
     if (!parsed.valid) {
-      this.abortWithClose(parsed.errorCode, parsed.reason);
+      await this.abortWithClose(parsed.errorCode, parsed.reason);
       return;
     }
 
     let echoed = true;
     if (!this._closeEvent) {
       try {
-        this.sendClosePayload(data);
+        await this.sendClosePayload(data);
       } catch {
         echoed = false;
       }
@@ -487,21 +492,16 @@ export class AsyncWebSocket {
       (code >= 3000 && code <= 4999);
   }
 
-  private sendClosePayload(payload: Buffer): void {
-    const { code, sent } = curl_ws_send(this.handle, payload, CurlWsFlag.CURLWS_CLOSE);
-    if (code !== CurlCode.CURLE_OK || sent !== payload.length) {
-      throw new WebSocketError(code !== CurlCode.CURLE_OK
-        ? `Close send failed with code ${code}`
-        : `Incomplete close send: ${sent}/${payload.length} bytes`, code);
-    }
+  private async sendClosePayload(payload: Buffer): Promise<void> {
+    await this.enqueueSend(payload, CurlWsFlag.CURLWS_CLOSE, true);
   }
 
-  private abortWithClose(code: number, reason: string): void {
+  private async abortWithClose(code: number, reason: string): Promise<void> {
     const reasonBytes = Buffer.from(reason, "utf-8").subarray(0, 123);
     const payload = Buffer.alloc(2 + reasonBytes.length);
     payload.writeUInt16BE(code, 0);
     reasonBytes.copy(payload, 2);
-    try { this.sendClosePayload(payload); } catch { /* best effort protocol error */ }
+    try { await this.sendClosePayload(payload); } catch { /* best effort protocol error */ }
     this._closeEvent = { code: CLOSE_ABNORMAL, reason, wasClean: false };
     this.failConnection();
   }
@@ -567,7 +567,7 @@ export class AsyncWebSocket {
         else resolve(message!);
       };
 
-      const poll = (): void => {
+      const poll = async (): Promise<void> => {
         if (pending.settled) return;
         if (Date.now() - startTime >= timeoutMs) {
           settle(new WebSocketError("Receive timeout"));
@@ -579,20 +579,20 @@ export class AsyncWebSocket {
         }
 
         try {
-          const message = this.tryReceive();
+          const message = await this.tryReceive();
           if (message) {
             settle(null, message);
             return;
           }
           if (!this._closed && !this.closing && !pending.settled) {
-            pending.timer = setTimeout(poll, this.pollInterval);
+            pending.timer = setTimeout(() => { void poll(); }, this.pollInterval);
           }
         } catch (error) {
           settle(error);
         }
       };
 
-      poll();
+      void poll();
     });
   }
 
@@ -612,25 +612,59 @@ export class AsyncWebSocket {
     return JSON.parse(str) as T;
   }
 
-  /**
-   * Send raw data with flags
-   */
-  private async sendRaw(data: Buffer, flags: number): Promise<void> {
-    if (this._closed) {
-      throw new WebSocketClosed(
-        this._closeEvent?.code ?? CLOSE_ABNORMAL,
-        this._closeEvent?.reason || "Connection closed"
-      );
-    }
+  /** Wait without blocking the event loop before retrying a socket write. */
+  private async waitForWritable(deadline: number, allowClosing: boolean): Promise<void> {
+    if (!this.multi) throw this.closedError();
+    if (this._closed || (!allowClosing && this.closing)) throw this.closedError();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new WebSocketError("WebSocket send timeout");
 
-    const { code, sent } = curl_ws_send(this.handle, data, flags);
-    if (code !== CurlCode.CURLE_OK || sent !== data.length) {
-      const error = new WebSocketError(code !== CurlCode.CURLE_OK
-        ? `Send failed with code ${code}`
-        : `Incomplete send: ${sent}/${data.length} bytes`, code);
-      this.failConnection(error);
-      throw error;
+    const poll = curl_multi_poll(this.multi, 0);
+    if (poll.code !== CurlMCode.CURLM_OK) {
+      throw new WebSocketError(`WebSocket send poll failed with multi code ${poll.code}`);
     }
+    await new Promise<void>((resolve) => setTimeout(resolve, poll.numfds > 0 ? 0 : Math.min(this.pollInterval, remaining)));
+    if (this._closed || (!allowClosing && this.closing)) throw this.closedError();
+  }
+
+  /** Send one complete frame, continuing partial writes with CURLWS_OFFSET. */
+  private async sendFrame(data: Buffer, flags: number, allowClosing = false): Promise<void> {
+    const deadline = Date.now() + SEND_TIMEOUT_MS;
+    let offset = 0;
+    let first = true;
+
+    do {
+      if (this._closed || (!allowClosing && this.closing)) throw this.closedError();
+      const remaining = data.subarray(offset);
+      const usesOffset = data.length > 0;
+      const sendFlags = usesOffset ? flags | CurlWsFlag.CURLWS_OFFSET : flags;
+      const fragsize = first && usesOffset ? BigInt(data.length) : 0n;
+      const { code, sent } = curl_ws_send(this.handle, remaining, sendFlags, fragsize);
+      if (!Number.isSafeInteger(sent) || sent < 0 || sent > remaining.length) {
+        throw new WebSocketError(`Invalid WebSocket send count: ${sent}`);
+      }
+      offset += sent;
+      if (sent > 0) first = false;
+      if (offset === data.length && code === CurlCode.CURLE_OK) return;
+      if (code !== CurlCode.CURLE_OK && code !== CurlCode.CURLE_AGAIN) {
+        throw new WebSocketError(`Send failed with code ${code}`, code);
+      }
+      await this.waitForWritable(deadline, allowClosing);
+    } while (offset < data.length || data.length === 0);
+  }
+
+  /** Serialize frames so partial writes cannot interleave. */
+  private enqueueSend(data: Buffer, flags: number, allowClosing = false): Promise<void> {
+    const send = this.sendTail.then(() => this.sendFrame(data, flags, allowClosing));
+    this.sendTail = send.catch(() => undefined);
+    return send;
+  }
+
+  private sendRaw(data: Buffer, flags: number): Promise<void> {
+    return this.enqueueSend(data, flags).catch((error: unknown) => {
+      if (!(error instanceof WebSocketClosed)) this.failConnection(error);
+      throw error;
+    });
   }
 
   /**
@@ -697,15 +731,9 @@ export class AsyncWebSocket {
     await this.sendRaw(buffer, CurlWsFlag.CURLWS_PONG);
   }
 
-  /** Answer a received ping synchronously so failures surface in the active receive. */
-  private sendPongNow(data: Buffer): void {
-    const { code, sent } = curl_ws_send(this.handle, data, CurlWsFlag.CURLWS_PONG);
-    if (code !== CurlCode.CURLE_OK) {
-      throw new WebSocketError(`Automatic pong failed with code ${code}`);
-    }
-    if (sent !== data.length) {
-      throw new WebSocketError(`Incomplete automatic pong: ${sent}/${data.length} bytes`);
-    }
+  /** Answer a received ping before continuing the active receive. */
+  private async sendPongNow(data: Buffer): Promise<void> {
+    await this.enqueueSend(data, CurlWsFlag.CURLWS_PONG);
   }
 
   /**
@@ -729,7 +757,7 @@ export class AsyncWebSocket {
 
     this.closePromise = (async () => {
       try {
-        this.sendClosePayload(payload);
+        await this.sendClosePayload(payload);
       } catch (error) {
         this.failConnection(error);
         throw error;
@@ -739,7 +767,7 @@ export class AsyncWebSocket {
       const deadline = Date.now() + CLOSE_SETTLE_MS;
       while (!this._closed && Date.now() < deadline) {
         try {
-          this.tryReceive();
+          await this.tryReceive();
         } catch (error) {
           if (error instanceof WebSocketClosed) break;
           throw error;
