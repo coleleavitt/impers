@@ -1,7 +1,8 @@
 import koffi from "koffi";
 import { resolveLibcurlPath } from "../utils/platform.js";
 
-const lib = koffi.load(await resolveLibcurlPath());
+export const loadedLibcurlPath = await resolveLibcurlPath();
+const lib = koffi.load(loadedLibcurlPath);
 const koffiTypeSuffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
 // Type aliases for clarity
@@ -474,6 +475,17 @@ try {
 function hasImpersonateSupport(): boolean {
   return curl_easy_impersonate !== null;
 }
+
+/** Runtime details for the libcurl handle loaded by this module. */
+export interface LoadedLibcurlInfo {
+  readonly path: string;
+  readonly hasCurlEasyImpersonate: boolean;
+}
+
+export const loadedLibcurlInfo: Readonly<LoadedLibcurlInfo> = Object.freeze({
+  path: loadedLibcurlPath,
+  hasCurlEasyImpersonate: curl_easy_impersonate !== null,
+});
 
 // ============================================================================
 // Exports

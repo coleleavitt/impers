@@ -4,11 +4,27 @@ import {
   resolveLibrary,
   writeExtractedEntries,
 } from "../src/ffi/loader.js";
+import {
+  hasImpersonateSupport,
+  loadedLibcurlInfo,
+  loadedLibcurlPath,
+  type LoadedLibcurlInfo,
+} from "../src/public.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 describe("libcurl loader", () => {
+  it("reports immutable details for the loaded native library", () => {
+    const info: Readonly<LoadedLibcurlInfo> = loadedLibcurlInfo;
+
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(info).toEqual({
+      path: loadedLibcurlPath,
+      hasCurlEasyImpersonate: hasImpersonateSupport(),
+    });
+  });
+
   it("pins the curl-impersonate release", () => {
     expect(LIBCURL_IMPERSONATE_VERSION).toBe("v2.2.2");
     expect(LIBCURL_IMPERSONATE_RELEASE_URL).toBe(

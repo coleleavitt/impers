@@ -159,6 +159,12 @@ export { Request } from "./http/request.js";
 export { Headers } from "./http/headers.js";
 export { Cookies } from "./http/cookies.js";
 export { Curl } from "./core/easy.js";
+export {
+  loadedLibcurlInfo,
+  loadedLibcurlPath,
+  hasImpersonateSupport,
+  type LoadedLibcurlInfo,
+} from "./ffi/libcurl.js";
 export { CurlMime } from "./core/mime.js";
 export { CurlMulti, getSharedMulti, closeSharedMulti } from "./core/multi.js";
 export { CurlOpt, CurlInfo, CurlCode, CurlHttpVersion, CurlWsFlag, CurlImpersonateOpt, CurlSslVersion } from "./ffi/constants.js";
