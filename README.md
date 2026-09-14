@@ -122,7 +122,7 @@ await session.close();
 
 ### Streaming responses
 
-`Session.stream()` resolves when the final response headers and first body chunk arrive. For an empty response it resolves when the transfer completes. Consume `iterContent()` or use the async body helpers. Closing the response cancels an unfinished transfer.
+`Session.stream()` resolves when the final response headers arrive. The body continues as a live stream; an empty response settles when the transfer completes. Consume `iterContent()` or use the async body helpers. Closing the response cancels an unfinished transfer.
 
 ```typescript
 const session = new Session();
