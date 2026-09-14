@@ -5,6 +5,9 @@ import {
   isLibName,
   resolveLibrary,
   writeExtractedEntries,
+  captureCleanupIdentity,
+  cleanupCreatedTree,
+  cleanupLockDirectory,
 } from "../src/ffi/loader.js";
 import {
   hasImpersonateSupport,
@@ -18,6 +21,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -416,4 +420,54 @@ describe("libcurl loader", () => {
       }
     }
   );
+  it("refuses temp cleanup when an ancestor is replaced with a symlink to the original tree", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    const ancestor = join(sandbox, "cache");
+    const relocated = join(sandbox, "relocated-cache");
+    const tempDir = join(ancestor, "version", ".target.tmp-test");
+    const sentinel = join(tempDir, "outside-sentinel");
+    mkdirSync(tempDir, { recursive: true, mode: 0o700 });
+    writeFileSync(sentinel, "untouched");
+    const identity = captureCleanupIdentity(tempDir);
+
+    try {
+      renameSync(ancestor, relocated);
+      symlinkSync(relocated, ancestor, "dir");
+
+      expect(() => cleanupCreatedTree(tempDir, identity)).toThrow(
+        "Refusing cleanup through replaced path"
+      );
+      expect(readFileSync(join(relocated, "version", ".target.tmp-test", "outside-sentinel"), "utf8"))
+        .toBe("untouched");
+      expect(existsSync(join(relocated, "version", ".target.tmp-test"))).toBe(true);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses lock cleanup when an ancestor is replaced with a symlink to the original lock", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    const ancestor = join(sandbox, "cache");
+    const relocated = join(sandbox, "relocated-cache");
+    const lockDir = join(ancestor, "version", "linux-x64.lock");
+    const owner = "test-owner\n";
+    mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(lockDir, "owner"), owner, { mode: 0o600 });
+    const identity = captureCleanupIdentity(lockDir);
+
+    try {
+      renameSync(ancestor, relocated);
+      symlinkSync(relocated, ancestor, "dir");
+
+      expect(() => cleanupLockDirectory(lockDir, identity, owner)).toThrow(
+        "Refusing cleanup through replaced path"
+      );
+      expect(readFileSync(join(relocated, "version", "linux-x64.lock", "owner"), "utf8"))
+        .toBe(owner);
+      expect(existsSync(join(relocated, "version", "linux-x64.lock"))).toBe(true);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
 });

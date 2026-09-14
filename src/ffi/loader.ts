@@ -141,20 +141,74 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type PathIdentity = { dev: bigint; ino: bigint };
+type PathIdentity = {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+  uid: bigint;
+  mode: bigint;
+  kind: "directory" | "file" | "symlink" | "other";
+};
+type PathIdentityChain = PathIdentity[];
 
-function pathIdentity(path: string): PathIdentity {
+function identityForPath(path: string): PathIdentity {
   const stat = lstatSync(path, { bigint: true });
-  return { dev: stat.dev, ino: stat.ino };
+  return {
+    path,
+    dev: stat.dev,
+    ino: stat.ino,
+    uid: stat.uid,
+    mode: stat.mode,
+    kind: stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" :
+      stat.isFile() ? "file" : "other",
+  };
 }
 
-function hasIdentity(path: string, identity: PathIdentity): boolean {
-  try {
-    const current = pathIdentity(path);
-    return current.dev === identity.dev && current.ino === identity.ino;
-  } catch {
-    return false;
+function captureDirectoryIdentityChain(path: string): PathIdentityChain {
+  const absolute = resolve(path);
+  const root = parse(absolute).root;
+  const components = relative(root, absolute).split(/[\\/]/).filter(Boolean);
+  const paths = [root];
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    paths.push(current);
   }
+  const chain = paths.map(identityForPath);
+  for (const identity of chain) {
+    if (identity.kind !== "directory") {
+      throw new Error(`Unsafe cleanup ancestor: ${identity.path}`);
+    }
+  }
+  const leaf = chain[chain.length - 1];
+  if (typeof process.getuid === "function" && Number(leaf.uid) !== process.getuid()) {
+    throw new Error(`Cleanup directory is not owned by the current user: ${leaf.path}`);
+  }
+  if ((Number(leaf.mode) & 0o077) !== 0) {
+    throw new Error(`Cleanup directory is not private: ${leaf.path}`);
+  }
+  return chain;
+}
+
+function assertIdentityChain(chain: PathIdentityChain): void {
+  for (const expected of chain) {
+    let current: PathIdentity;
+    try {
+      current = identityForPath(expected.path);
+    } catch {
+      throw new Error(`Refusing cleanup through replaced path: ${expected.path}`);
+    }
+    if (current.kind === "symlink" || current.kind !== expected.kind ||
+        current.dev !== expected.dev || current.ino !== expected.ino ||
+        current.uid !== expected.uid || current.mode !== expected.mode) {
+      throw new Error(`Refusing cleanup through replaced path: ${expected.path}`);
+    }
+  }
+}
+
+function appendIdentity(chain: PathIdentityChain, path: string): PathIdentityChain {
+  assertIdentityChain(chain);
+  return [...chain, identityForPath(path)];
 }
 
 function validateDirectoryAncestors(path: string): void {
@@ -200,45 +254,62 @@ function ensurePrivateDirectory(path: string): void {
   }
 }
 
-function removeCreatedTree(path: string, identity: PathIdentity): void {
-  if (!hasIdentity(path, identity)) {
-    throw new Error(`Refusing to clean up replaced cache path: ${path}`);
-  }
+function removeCreatedTree(path: string, chain: PathIdentityChain): void {
+  assertIdentityChain(chain);
   for (const entry of readdirSync(path)) {
+    assertIdentityChain(chain);
     const child = join(path, entry);
-    const stat = lstatSync(child, { bigint: true });
-    if (stat.isDirectory() && !stat.isSymbolicLink()) {
-      removeCreatedTree(child, { dev: stat.dev, ino: stat.ino });
+    const childChain = appendIdentity(chain, child);
+    const childIdentity = childChain[childChain.length - 1];
+    if (childIdentity.kind === "directory") {
+      removeCreatedTree(child, childChain);
     } else {
+      assertIdentityChain(childChain);
       unlinkSync(child);
     }
   }
-  if (!hasIdentity(path, identity)) {
-    throw new Error(`Refusing to clean up replaced cache path: ${path}`);
-  }
+  assertIdentityChain(chain);
   rmdirSync(path);
 }
 
-function removeLockDirectory(lockDir: string, identity: PathIdentity, owner: string): void {
-  if (!hasIdentity(lockDir, identity)) {
-    throw new Error(`Refusing to remove replaced cache lock: ${lockDir}`);
-  }
+function removeLockDirectory(lockDir: string, chain: PathIdentityChain, owner: string): void {
+  assertIdentityChain(chain);
   const entries = readdirSync(lockDir);
   if (entries.length !== 1 || entries[0] !== "owner") {
     throw new Error(`Refusing to remove an unrecognized cache lock: ${lockDir}`);
   }
   const ownerPath = join(lockDir, "owner");
-  const ownerStat = lstatSync(ownerPath, { bigint: true });
-  const ownerIdentity = { dev: ownerStat.dev, ino: ownerStat.ino };
-  if (!ownerStat.isFile() || ownerStat.isSymbolicLink() || readFileSync(ownerPath, "utf8") !== owner ||
-      !hasIdentity(ownerPath, ownerIdentity)) {
+  const ownerChain = appendIdentity(chain, ownerPath);
+  const ownerIdentity = ownerChain[ownerChain.length - 1];
+  if (ownerIdentity.kind !== "file" || readFileSync(ownerPath, "utf8") !== owner) {
     throw new Error(`Refusing to remove a replaced cache lock owner: ${ownerPath}`);
   }
+  assertIdentityChain(ownerChain);
   unlinkSync(ownerPath);
-  if (!hasIdentity(lockDir, identity)) {
-    throw new Error(`Refusing to remove replaced cache lock: ${lockDir}`);
-  }
+  assertIdentityChain(chain);
   rmdirSync(lockDir);
+}
+
+/** @internal Cleanup identity seam for deterministic TOCTOU regression tests. */
+export type CleanupIdentity = PathIdentityChain;
+
+/** @internal */
+export function captureCleanupIdentity(path: string): CleanupIdentity {
+  return captureDirectoryIdentityChain(path);
+}
+
+/** @internal */
+export function cleanupCreatedTree(path: string, identity: CleanupIdentity): void {
+  removeCreatedTree(path, identity);
+}
+
+/** @internal */
+export function cleanupLockDirectory(
+  path: string,
+  identity: CleanupIdentity,
+  owner: string
+): void {
+  removeLockDirectory(path, identity, owner);
 }
 
 function removeStaleLock(lockDir: string): boolean {
@@ -247,14 +318,14 @@ function removeStaleLock(lockDir: string): boolean {
     if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
     if (typeof process.getuid === "function" && Number(stat.uid) !== process.getuid()) return false;
     if ((Number(stat.mode) & 0o077) !== 0) return false;
-    const identity = { dev: stat.dev, ino: stat.ino };
+    const chain = captureDirectoryIdentityChain(lockDir);
     const entries = readdirSync(lockDir);
     if (entries.length !== 1 || entries[0] !== "owner") return false;
     const ownerPath = join(lockDir, "owner");
     const ownerStat = lstatSync(ownerPath);
     if (!ownerStat.isFile() || ownerStat.isSymbolicLink()) return false;
     const owner = readFileSync(ownerPath, "utf8");
-    removeLockDirectory(lockDir, identity, owner);
+    removeLockDirectory(lockDir, chain, owner);
     return true;
   } catch {
     return false;
@@ -270,12 +341,12 @@ async function withCacheLock<T>(
   const lockDir = getCacheLockDir(cacheRoot, platform, arch);
   const started = Date.now();
   const owner = `${process.pid}:${randomBytes(16).toString("hex")}\n`;
-  let lockIdentity: PathIdentity | null = null;
+  let lockIdentity: PathIdentityChain | null = null;
 
   while (!lockIdentity) {
     try {
       mkdirSync(lockDir, { mode: 0o700 });
-      lockIdentity = pathIdentity(lockDir);
+      lockIdentity = captureDirectoryIdentityChain(lockDir);
       const ownerFd = openSync(
         join(lockDir, "owner"),
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
@@ -639,7 +710,7 @@ async function downloadImpersonate(
   }
 
   const tempDir = mkdtempSync(join(targetParent, `.${basename(targetDir)}.tmp-`));
-  const tempIdentity = pathIdentity(tempDir);
+  const tempIdentity = captureDirectoryIdentityChain(tempDir);
   let published = false;
   try {
     writeExtractedEntries(extracted, tempDir, platform);
