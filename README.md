@@ -45,11 +45,12 @@ npm install impers
 
 **libcurl-impersonate**: For full fingerprinting support, you need [curl-impersonate](https://github.com/lexiforest/curl-impersonate) installed. Standard libcurl works but without impersonation features.
 
-If you have an internet connection, `impers` downloads the pinned curl-impersonate
-release (`v2.2.2`) on first launch. An existing library in that pinned-version cache is
-preferred over auto-detected system installations, which may not support the current
-browser aliases. Set `IMPER_DOWNLOAD_LIBCURL=0` to disable downloads; an existing pinned
-cache or an explicitly configured library can still be used.
+Automatic native-library downloads are disabled by default because the upstream release
+does not publish a trusted checksum manifest. To opt in, set `IMPER_DOWNLOAD_LIBCURL=1`,
+`IMPER_LIBCURL_ASSET_SHA256` to the expected release-asset SHA-256, and
+`IMPER_LIBCURL_SHA256` to the expected extracted library SHA-256. Downloads and cached
+libraries fail closed on a missing or mismatched digest. Explicitly configured libraries
+remain available without enabling downloads.
 
 To use your own version, set `LIBCURL_IMPERSONATE_PATH` (or `LIBCURL_PATH`) explicitly:
 

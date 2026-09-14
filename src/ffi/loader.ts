@@ -1,7 +1,10 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
+  realpathSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
@@ -9,7 +12,8 @@ import {
   writeFileSync,
 } from "fs";
 import { homedir } from "os";
-import { basename, dirname, join } from "path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
+import { createHash } from "node:crypto";
 import https from "node:https";
 import { gunzipSync, inflateRawSync } from "node:zlib";
 
@@ -274,34 +278,82 @@ function findSystemLibrary(
   return candidates[0];
 }
 
+function isContained(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function sha256(data: Uint8Array): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+function sha256File(path: string): string {
+  return sha256(readFileSync(path));
+}
+
+function normalizeSha256(value: string | undefined): string | null {
+  const digest = value?.trim().toLowerCase();
+  return digest && /^[a-f0-9]{64}$/.test(digest) ? digest : null;
+}
+
 function collectLibraryCandidates(rootDir: string, libExt: string): string[] {
   const candidates: string[] = [];
-  const queue: string[] = [rootDir];
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(rootDir);
+  } catch {
+    return candidates;
+  }
+
+  const queue: string[] = [rootReal];
+  const visited = new Set<string>();
 
   while (queue.length > 0) {
     const current = queue.pop()!;
+    let currentReal: string;
+    let currentStat;
+    try {
+      currentReal = realpathSync(current);
+      currentStat = statSync(currentReal);
+    } catch {
+      continue;
+    }
+    if (!currentStat.isDirectory() || !isContained(rootReal, currentReal)) {
+      continue;
+    }
+    const identity = `${currentStat.dev}:${currentStat.ino}:${currentReal}`;
+    if (visited.has(identity)) {
+      continue;
+    }
+    visited.add(identity);
+
     let entries: string[];
     try {
-      entries = readdirSync(current);
+      entries = readdirSync(currentReal);
     } catch {
       continue;
     }
 
     for (const entry of entries) {
-      const fullPath = join(current, entry);
-      let stat;
+      const fullPath = join(currentReal, entry);
+      let linkStat;
+      let resolvedPath: string;
+      let resolvedStat;
       try {
-        stat = statSync(fullPath);
+        linkStat = lstatSync(fullPath);
+        resolvedPath = realpathSync(fullPath);
+        resolvedStat = statSync(resolvedPath);
       } catch {
         continue;
       }
-
-      if (stat.isDirectory()) {
-        queue.push(fullPath);
+      if (!isContained(rootReal, resolvedPath)) {
         continue;
       }
-
-      if (isLibName(entry, LIB_PREFIX, libExt)) {
+      if (resolvedStat.isDirectory()) {
+        queue.push(resolvedPath);
+        continue;
+      }
+      if (!linkStat.isSymbolicLink() && resolvedStat.isFile() && isLibName(entry, LIB_PREFIX, libExt)) {
         candidates.push(fullPath);
       }
     }
@@ -310,7 +362,28 @@ function collectLibraryCandidates(rootDir: string, libExt: string): string[] {
   return candidates;
 }
 
-function findCachedLibrary(cacheRoot: string, platform: string, arch: string): string | null {
+function isVerifiedRegularFile(path: string, root: string, expectedDigest: string): boolean {
+  try {
+    const linkStat = lstatSync(path);
+    const real = realpathSync(path);
+    return linkStat.isFile() &&
+      statSync(real).isFile() &&
+      isContained(realpathSync(root), real) &&
+      sha256File(real) === expectedDigest;
+  } catch {
+    return false;
+  }
+}
+
+function findCachedLibrary(
+  cacheRoot: string,
+  platform: string,
+  arch: string,
+  expectedDigest: string | null
+): string | null {
+  if (!expectedDigest) {
+    return null;
+  }
   const cacheDir = getCacheDir(cacheRoot, platform, arch);
   if (!existsSync(cacheDir)) {
     return null;
@@ -318,20 +391,14 @@ function findCachedLibrary(cacheRoot: string, platform: string, arch: string): s
 
   const libExt = PLATFORM_LIB_EXT[platform] || ".so";
   const candidates = collectLibraryCandidates(cacheDir, libExt);
-  if (candidates.length === 0) {
-    return null;
-  }
-
   const exactName = `${LIB_PREFIX}${libExt}`;
-  for (const candidate of candidates) {
-    if (basename(candidate) === exactName && isNonEmptyFile(candidate)) {
-      return candidate;
-    }
-  }
-
-  const nonEmpty = candidates.filter((candidate) => isNonEmptyFile(candidate));
-  nonEmpty.sort((a, b) => basename(a).length - basename(b).length);
-  return nonEmpty[0] || null;
+  candidates.sort((a, b) => {
+    const exactDelta = Number(basename(a) === exactName) - Number(basename(b) === exactName);
+    return exactDelta || basename(a).length - basename(b).length;
+  });
+  return candidates.find((candidate) =>
+    isVerifiedRegularFile(candidate, cacheDir, expectedDigest)
+  ) ?? null;
 }
 
 type ReleaseAsset = {
@@ -356,12 +423,16 @@ async function tryDownloadImpersonate(
     return null;
   }
 
-  const cached = findCachedLibrary(cacheRoot, platform, arch);
+  const libraryDigest = normalizeSha256(env.IMPER_LIBCURL_SHA256);
+  const assetDigest = normalizeSha256(env.IMPER_LIBCURL_ASSET_SHA256);
+  const cached = findCachedLibrary(cacheRoot, platform, arch, libraryDigest);
   if (cached) {
     return cached;
   }
 
-  if (env.IMPER_DOWNLOAD_LIBCURL === "0") {
+  // No upstream checksum manifest is available. Downloads therefore require
+  // explicit opt-in and both the archive and extracted library digests.
+  if (env.IMPER_DOWNLOAD_LIBCURL !== "1" || !assetDigest || !libraryDigest) {
     return null;
   }
 
@@ -369,14 +440,21 @@ async function tryDownloadImpersonate(
 
   try {
     return await withCacheLock(cacheRoot, platform, arch, async () => {
-      const cachedAfterLock = findCachedLibrary(cacheRoot, platform, arch);
+      const cachedAfterLock = findCachedLibrary(cacheRoot, platform, arch, libraryDigest);
       if (cachedAfterLock) {
         return cachedAfterLock;
       }
-      return await downloadImpersonate(cacheRoot, platform, arch, env);
+      return await downloadImpersonate(
+        cacheRoot,
+        platform,
+        arch,
+        assetDigest,
+        libraryDigest,
+        env
+      );
     });
   } catch {
-    return findCachedLibrary(cacheRoot, platform, arch);
+    return findCachedLibrary(cacheRoot, platform, arch, libraryDigest);
   }
 }
 
@@ -384,6 +462,8 @@ async function downloadImpersonate(
   cacheRoot: string,
   platform: string,
   arch: string,
+  expectedAssetDigest: string,
+  expectedLibraryDigest: string,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<string> {
   const libExt = PLATFORM_LIB_EXT[platform] || ".so";
@@ -403,25 +483,36 @@ async function downloadImpersonate(
   }
 
   const archive = await fetchBuffer(asset.browser_download_url, headers);
+  if (sha256(archive) !== expectedAssetDigest) {
+    throw new Error("Downloaded curl-impersonate asset failed SHA-256 verification");
+  }
   const extracted = extractArchive(archive, asset.name, libExt);
   if (extracted.length === 0) {
     throw new Error("No libcurl-impersonate binary found in release asset");
   }
 
+  rmSync(targetDir, { recursive: true, force: true });
   mkdirSync(targetDir, { recursive: true });
-  writeExtractedEntries(extracted, targetDir, platform);
-
-  const resolved = findCachedLibrary(cacheRoot, platform, arch);
-  if (!resolved) {
-    throw new Error("Failed to locate libcurl-impersonate after extraction");
+  try {
+    writeExtractedEntries(extracted, targetDir, platform);
+    const resolved = findCachedLibrary(cacheRoot, platform, arch, expectedLibraryDigest);
+    if (!resolved) {
+      throw new Error("Extracted libcurl-impersonate failed SHA-256 verification");
+    }
+    return resolved;
+  } catch (error) {
+    rmSync(targetDir, { recursive: true, force: true });
+    throw error;
   }
-  return resolved;
 }
 
 function sanitizeArchivePath(name: string): string | null {
   const normalized = name.replace(/\\/g, "/");
-  const parts = normalized.split("/").filter((part) => part && part !== "." && part !== "..");
-  if (parts.length === 0) {
+  if (!normalized || normalized.startsWith("/") || /^[a-zA-Z]:\//.test(normalized)) {
+    return null;
+  }
+  const parts = normalized.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
     return null;
   }
   return parts.join("/");
@@ -439,47 +530,66 @@ export function writeExtractedEntries(
   targetDir: string,
   platform: string
 ): void {
-  const symlinks: Array<{ outPath: string; linkName: string }> = [];
-
-  for (const entry of entries) {
+  const targetRoot = resolve(targetDir);
+  const prepared = entries.map((entry) => {
     const safePath = sanitizeArchivePath(entry.name);
     if (!safePath) {
+      throw new Error(`Unsafe archive entry path: ${entry.name}`);
+    }
+    const outPath = resolve(targetRoot, safePath);
+    if (!isContained(targetRoot, outPath)) {
+      throw new Error(`Archive entry escapes extraction root: ${entry.name}`);
+    }
+    return { entry, safePath, outPath };
+  }).filter(({ safePath }) =>
+    platform !== "win32" || safePath.startsWith("bin/") || safePath.startsWith("lib/")
+  );
+
+  const symlinkTargets = new Map<string, string>();
+  for (const { entry, outPath } of prepared) {
+    if (entry.type !== "symlink") {
       continue;
     }
-
-    if (platform === "win32") {
-      if (!safePath.startsWith("bin/") && !safePath.startsWith("lib/")) {
-        continue;
-      }
+    if (!entry.linkName || isAbsolute(entry.linkName) || /^[a-zA-Z]:[\\/]/.test(entry.linkName)) {
+      throw new Error(`Unsafe archive symlink target: ${entry.linkName ?? ""}`);
     }
+    const target = resolve(dirname(outPath), entry.linkName);
+    if (!isContained(targetRoot, target)) {
+      throw new Error(`Archive symlink escapes extraction root: ${entry.name}`);
+    }
+    symlinkTargets.set(outPath, target);
+  }
 
-    const relativePath = safePath;
-    const outPath = join(targetDir, relativePath);
-    mkdirSync(dirname(outPath), { recursive: true });
+  for (const origin of symlinkTargets.keys()) {
+    const visited = new Set<string>();
+    let current: string | undefined = origin;
+    while (current && symlinkTargets.has(current)) {
+      if (visited.has(current)) {
+        throw new Error(`Archive symlink cycle detected: ${origin}`);
+      }
+      visited.add(current);
+      current = symlinkTargets.get(current);
+    }
+  }
 
+  mkdirSync(targetRoot, { recursive: true });
+  for (const { entry, outPath } of prepared) {
     if (entry.type === "symlink") {
-      if (platform !== "win32" && entry.linkName) {
-        symlinks.push({ outPath, linkName: entry.linkName });
-      }
       continue;
     }
-
+    mkdirSync(dirname(outPath), { recursive: true });
     writeFileAtomic(outPath, entry.data ?? Buffer.alloc(0));
   }
 
   if (platform === "win32") {
     return;
   }
-
-  for (const { outPath, linkName } of symlinks) {
-    if (existsSync(outPath)) {
+  for (const { entry, outPath } of prepared) {
+    if (entry.type !== "symlink") {
       continue;
     }
-    try {
-      symlinkSync(linkName, outPath);
-    } catch {
-      // Ignore symlink creation failures
-    }
+    mkdirSync(dirname(outPath), { recursive: true });
+    symlinkSync(entry.linkName!, outPath);
   }
 }
 
@@ -525,26 +635,19 @@ function fetchBuffer(
   });
 }
 
-function pickAsset(assets: ReleaseAsset[], platform: string, arch: string): ReleaseAsset | null {
-  const candidates = assets.filter((asset) =>
-    asset &&
-    typeof asset.name === "string" &&
-    typeof asset.browser_download_url === "string"
-  );
-
-  const filtered = candidates.filter((asset) => {
-    const name = asset.name!.toLowerCase();
-    const hasArchiveExt = name.endsWith(".tar.gz") || name.endsWith(".tgz") || name.endsWith(".tar") ||
-      name.endsWith(".zip") || name.endsWith(".dylib") || name.endsWith(".dll") ||
-      name.includes(".so");
-    return name.startsWith("libcurl") && name.includes("impersonate") && hasArchiveExt;
-  });
-
+/** @internal Exported for release selection regression tests. */
+export function pickAsset(
+  assets: ReleaseAsset[],
+  platform: string,
+  arch: string
+): ReleaseAsset | null {
   const platformTokens = platform === "darwin"
     ? ["macos", "darwin", "osx", "mac"]
     : platform === "linux"
     ? ["linux"]
-    : ["win", "windows"];
+    : platform === "win32"
+    ? ["win", "windows"]
+    : [platform];
   const platformExcludes = platform === "linux"
     ? ["android"]
     : platform === "darwin"
@@ -556,25 +659,21 @@ function pickAsset(assets: ReleaseAsset[], platform: string, arch: string): Rele
     ? ["x86_64", "x64", "amd64"]
     : [arch];
 
-  const matched = filtered.filter((asset) =>
-    hasAnyToken(asset.name!, platformTokens) &&
-    hasAnyToken(asset.name!, archTokens) &&
-    !hasAnyToken(asset.name!, platformExcludes)
-  );
-  const platformMatched = matched.length > 0
-    ? matched
-    : filtered.filter((asset) =>
-      hasAnyToken(asset.name!, platformTokens) &&
-      !hasAnyToken(asset.name!, platformExcludes)
-    );
-
-  const abiMatched = platform === "linux"
-    ? preferLinuxAbi(platformMatched)
-    : platformMatched;
-  const pool = abiMatched.length > 0 ? abiMatched : filtered;
-
-  pool.sort((a, b) => rankByExt(a.name!, platform) - rankByExt(b.name!, platform));
-  return pool[0] || null;
+  const matched = assets.filter((asset) => {
+    if (typeof asset.name !== "string" || typeof asset.browser_download_url !== "string") {
+      return false;
+    }
+    const name = asset.name.toLowerCase();
+    const supported = name.endsWith(".tar.gz") || name.endsWith(".tgz") ||
+      name.endsWith(".tar") || name.endsWith(".zip") || name.endsWith(".dylib") ||
+      name.endsWith(".dll") || name.includes(".so");
+    return name.startsWith("libcurl") && name.includes("impersonate") && supported &&
+      hasAnyToken(name, platformTokens) && hasAnyToken(name, archTokens) &&
+      !hasAnyToken(name, platformExcludes);
+  });
+  const abiMatched = platform === "linux" ? preferLinuxAbi(matched) : matched;
+  abiMatched.sort((a, b) => rankByExt(a.name!, platform) - rankByExt(b.name!, platform));
+  return abiMatched[0] ?? null;
 }
 
 function preferLinuxAbi(assets: ReleaseAsset[]): ReleaseAsset[] {
@@ -789,7 +888,7 @@ export async function resolveLibrary(
 
   const cacheRoot = getCacheRoot(env, platform);
   if (cacheRoot) {
-    const cachedPath = findCachedLibrary(cacheRoot, platform, arch);
+    const cachedPath = findCachedLibrary(cacheRoot, platform, arch, normalizeSha256(env.IMPER_LIBCURL_SHA256));
     if (cachedPath) {
       return { path: cachedPath, isImpersonate: true };
     }
