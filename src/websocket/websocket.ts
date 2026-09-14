@@ -91,10 +91,16 @@ export class AsyncWebSocket {
   private fragmentedMessage: { chunks: Buffer[]; flags: number; size: number } | null = null;
 
   private multi: CurlMultiHandle | null = null;
-  private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private pollInterval: number = 10; // ms between polls
   private resourcesReleased = false;
   private handleAddedToMulti = false;
+  private pendingReceives = new Set<{
+    timer: ReturnType<typeof setTimeout> | null;
+    settled: boolean;
+    reject: (error: unknown) => void;
+  }>();
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
 
   private maxMessageSize: number;
 
@@ -258,6 +264,7 @@ export class AsyncWebSocket {
 
   /** Release all native resources exactly once. */
   private cleanupResources(): void {
+    this.rejectPendingReceives(this.closedError());
     if (this.resourcesReleased) return;
     this.resourcesReleased = true;
     let failure: unknown;
@@ -282,7 +289,7 @@ export class AsyncWebSocket {
    * Check if connected
    */
   get connected(): boolean {
-    return this._connected && !this._closed;
+    return this._connected && !this._closed && !this.closing;
   }
 
   /**
@@ -312,7 +319,7 @@ export class AsyncWebSocket {
       if (code === CurlCode.CURLE_AGAIN) return null;
       if (code !== CurlCode.CURLE_OK) {
         const error = new WebSocketError(`Receive error: ${code}`, code);
-        this.failConnection();
+        this.failConnection(error);
         throw error;
       }
       if (received === 0 && frame === null) return null;
@@ -323,16 +330,20 @@ export class AsyncWebSocket {
       const frameLength = offset + received + bytesLeft;
       if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(bytesLeft) ||
           !Number.isSafeInteger(frameLength) || offset < 0 || bytesLeft < 0) {
-        this.failConnection();
-        throw new WebSocketError("Received invalid WebSocket frame metadata");
+        const error = new WebSocketError("Received invalid WebSocket frame metadata");
+        this.failConnection(error);
+        throw error;
       }
 
       const isControl = (flags & (CurlWsFlag.CURLWS_CLOSE | CurlWsFlag.CURLWS_PING | CurlWsFlag.CURLWS_PONG)) !== 0;
       const accumulated = isControl ? 0 : (this.fragmentedMessage?.size ?? 0);
       if (!isControl &&
           (frameLength > this.maxMessageSize || accumulated + frameLength > this.maxMessageSize)) {
-        this.failConnection();
-        throw new WebSocketError(`WebSocket message exceeds maximum size of ${this.maxMessageSize} bytes`);
+        const error = new WebSocketError(
+          `WebSocket message exceeds maximum size of ${this.maxMessageSize} bytes`
+        );
+        this.failConnection(error);
+        throw error;
       }
 
       let data: Buffer;
@@ -346,8 +357,9 @@ export class AsyncWebSocket {
         const fragmented = this.fragmentedFrame;
         if (!fragmented || offset !== fragmented.received || frameLength !== fragmented.data.length) {
           this.fragmentedFrame = null;
-          this.failConnection();
-          throw new WebSocketError("Received inconsistent fragmented WebSocket frame metadata");
+          const error = new WebSocketError("Received inconsistent fragmented WebSocket frame metadata");
+          this.failConnection(error);
+          throw error;
         }
         this.receiveBuffer.copy(fragmented.data, offset, 0, received);
         fragmented.received += received;
@@ -371,7 +383,7 @@ export class AsyncWebSocket {
           try {
             this.sendPongNow(message.data);
           } catch (error) {
-            this.failConnection();
+            this.failConnection(error);
             throw error;
           }
         }
@@ -383,8 +395,9 @@ export class AsyncWebSocket {
       const messageTypeFlags = frameFlags & (CurlWsFlag.CURLWS_TEXT | CurlWsFlag.CURLWS_BINARY);
       if (this.fragmentedMessage) {
         if (messageTypeFlags !== this.fragmentedMessage.flags) {
-          this.failConnection();
-          throw new WebSocketError("Fragmented WebSocket message changed type");
+          const error = new WebSocketError("Fragmented WebSocket message changed type");
+          this.failConnection(error);
+          throw error;
         }
         this.fragmentedMessage.chunks.push(data);
         this.fragmentedMessage.size += data.length;
@@ -493,15 +506,36 @@ export class AsyncWebSocket {
     this.failConnection();
   }
 
-  private stopPolling(): void {
-    if (this.pollTimer) clearTimeout(this.pollTimer);
-    this.pollTimer = null;
+  private closedError(): WebSocketClosed {
+    return new WebSocketClosed(
+      this._closeEvent?.code ?? CLOSE_ABNORMAL,
+      this._closeEvent?.reason || "Connection closed"
+    );
   }
 
-  private failConnection(): void {
+  private rejectPendingReceives(error: unknown): void {
+    for (const pending of [...this.pendingReceives]) {
+      if (pending.settled) continue;
+      pending.settled = true;
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.timer = null;
+      this.pendingReceives.delete(pending);
+      pending.reject(error);
+    }
+  }
+
+  private stopPolling(): void {
+    for (const pending of this.pendingReceives) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+  }
+
+  private failConnection(error: unknown = this.closedError()): void {
     this._closed = true;
     this._connected = false;
     this.stopPolling();
+    this.rejectPendingReceives(error);
     try { this.cleanupResources(); } catch { /* preserve the transport/protocol error */ }
   }
 
@@ -509,12 +543,7 @@ export class AsyncWebSocket {
    * Receive a message with polling
    */
   async recv(timeout?: number): Promise<WebSocketMessage> {
-    if (this._closed) {
-      throw new WebSocketClosed(
-        this._closeEvent?.code ?? CLOSE_ABNORMAL,
-        this._closeEvent?.reason || "Connection closed"
-      );
-    }
+    if (this._closed || this.closing) throw this.closedError();
 
     // Check queue first
     if (this.messageQueue.length > 0) {
@@ -524,55 +553,45 @@ export class AsyncWebSocket {
     const startTime = Date.now();
     const timeoutMs = timeout !== undefined ? timeout * 1000 : Infinity;
 
-    // Poll for message
     return new Promise<WebSocketMessage>((resolve, reject) => {
-      let settled = false;
+      const pending = { timer: null as ReturnType<typeof setTimeout> | null, settled: false, reject };
+      this.pendingReceives.add(pending);
 
-      const poll = () => {
-        if (settled) return;
+      const settle = (error: unknown, message?: WebSocketMessage): void => {
+        if (pending.settled) return;
+        pending.settled = true;
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.timer = null;
+        this.pendingReceives.delete(pending);
+        if (error) reject(error);
+        else resolve(message!);
+      };
 
-        // Check timeout
+      const poll = (): void => {
+        if (pending.settled) return;
         if (Date.now() - startTime >= timeoutMs) {
-          settled = true;
-          this.pollTimer = null;
-          reject(new WebSocketError("Receive timeout"));
+          settle(new WebSocketError("Receive timeout"));
           return;
         }
-
-        // Check if closed
-        if (this._closed) {
-          settled = true;
-          this.pollTimer = null;
-          reject(
-            new WebSocketClosed(
-              this._closeEvent?.code ?? CLOSE_ABNORMAL,
-              this._closeEvent?.reason || "Connection closed"
-            )
-          );
+        if (this._closed || this.closing) {
+          settle(this.closedError());
           return;
         }
 
         try {
           const message = this.tryReceive();
           if (message) {
-            settled = true;
-            this.pollTimer = null;
-            resolve(message);
+            settle(null, message);
             return;
           }
-
-          // No message, schedule next poll (only if not closed/settled)
-          if (!this._closed && !settled) {
-            this.pollTimer = setTimeout(poll, this.pollInterval);
+          if (!this._closed && !this.closing && !pending.settled) {
+            pending.timer = setTimeout(poll, this.pollInterval);
           }
         } catch (error) {
-          settled = true;
-          this.pollTimer = null;
-          reject(error);
+          settle(error);
         }
       };
 
-      // Start polling
       poll();
     });
   }
@@ -609,7 +628,7 @@ export class AsyncWebSocket {
       const error = new WebSocketError(code !== CurlCode.CURLE_OK
         ? `Send failed with code ${code}`
         : `Incomplete send: ${sent}/${data.length} bytes`, code);
-      this.failConnection();
+      this.failConnection(error);
       throw error;
     }
   }
@@ -694,8 +713,8 @@ export class AsyncWebSocket {
    */
   async close(code: number = 1000, reason: string = ""): Promise<void> {
     if (this._closed) return;
+    if (this.closePromise) return this.closePromise;
     if (!this.isValidCloseCode(code)) throw new WebSocketError(`Invalid close code: ${code}`);
-    this.stopPolling();
 
     const reasonBytes = Buffer.from(reason, "utf-8");
     if (reasonBytes.length > 123) throw new WebSocketError("Close reason exceeds 123 UTF-8 bytes");
@@ -703,33 +722,39 @@ export class AsyncWebSocket {
     payload.writeUInt16BE(code, 0);
     reasonBytes.copy(payload, 2);
 
-    try {
-      this.sendClosePayload(payload);
-    } catch (error) {
-      this.failConnection();
-      throw error;
-    }
-
-    // Record the local proposal but do not report a clean close until a valid peer CLOSE
-    // arrives. Continue receiving for a bounded period so the handshake can complete.
+    this.closing = true;
     this._closeEvent = { code, reason, wasClean: false };
-    const deadline = Date.now() + CLOSE_SETTLE_MS;
-    while (!this._closed && Date.now() < deadline) {
+    this.stopPolling();
+    this.rejectPendingReceives(this.closedError());
+
+    this.closePromise = (async () => {
       try {
-        this.tryReceive();
+        this.sendClosePayload(payload);
       } catch (error) {
-        if (error instanceof WebSocketClosed) break;
+        this.failConnection(error);
         throw error;
       }
-      if (!this._closed) await new Promise((resolve) => setTimeout(resolve, this.pollInterval));
-    }
 
-    if (!this._closed) {
-      this._closed = true;
-      this._connected = false;
-      this.stopPolling();
-      this.cleanupResources();
-    }
+      // Continue receiving for a bounded period so the peer can complete the handshake.
+      const deadline = Date.now() + CLOSE_SETTLE_MS;
+      while (!this._closed && Date.now() < deadline) {
+        try {
+          this.tryReceive();
+        } catch (error) {
+          if (error instanceof WebSocketClosed) break;
+          throw error;
+        }
+        if (!this._closed) await new Promise((resolve) => setTimeout(resolve, this.pollInterval));
+      }
+
+      if (!this._closed) {
+        this._closed = true;
+        this._connected = false;
+        this.stopPolling();
+        this.cleanupResources();
+      }
+    })();
+    return this.closePromise;
   }
 
   /**

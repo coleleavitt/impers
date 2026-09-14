@@ -55,6 +55,9 @@ beforeAll(async () => {
       case "/close-echo":
         socket.on("data", () => socket.write(frame(8, Buffer.from([0x03, 0xe8]))));
         break;
+      case "/close-destroy":
+        socket.on("data", () => socket.destroy());
+        break;
     }
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -124,6 +127,43 @@ describe("WebSocket protocol boundaries", () => {
     expect(ws.closed).toBe(true);
     await ws.close();
     await ws.close();
+  });
+
+  it("settles a pending receive when locally closed", async () => {
+    const ws = await wsConnect(url("/no-close"));
+    const receive = ws.recv();
+    const close = ws.close(1000, "done");
+
+    const results = await Promise.race([
+      Promise.allSettled([receive, close]),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("close and receive did not settle")), 1_000)
+      ),
+    ]);
+
+    expect(results[0]).toMatchObject({ status: "rejected", reason: expect.any(WebSocketClosed) });
+    expect(results[1]).toEqual({ status: "fulfilled", value: undefined });
+    expect(ws.closeEvent).toEqual({ code: 1000, reason: "done", wasClean: false });
+  });
+
+  it("settles a pending receive exactly once across double close and transport error", async () => {
+    const ws = await wsConnect(url("/close-destroy"));
+    let receiveSettlements = 0;
+    const receive = ws.recv().finally(() => { receiveSettlements += 1; });
+    const firstClose = ws.close(1000, "done");
+    const secondClose = ws.close(1001, "ignored");
+
+    const results = await Promise.race([
+      Promise.allSettled([receive, firstClose, secondClose]),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("close/error race did not settle")), 1_000)
+      ),
+    ]);
+
+    expect(results[0]).toMatchObject({ status: "rejected", reason: expect.any(WebSocketClosed) });
+    expect(results.slice(1).every((result) => result.status !== "pending")).toBe(true);
+    expect(receiveSettlements).toBe(1);
+    expect(ws.closed).toBe(true);
   });
 
   it("reports an unacknowledged local close as unclean and remains idempotent", async () => {
