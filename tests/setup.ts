@@ -5,7 +5,6 @@ import { startMockServer, stopMockServer, getServerUrl } from "./mock-server.js"
 
 // Store the server URL globally
 declare global {
-  // eslint-disable-next-line no-var
   var TEST_SERVER_URL: string;
 }
 

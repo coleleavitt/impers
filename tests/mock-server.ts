@@ -73,7 +73,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // GET endpoint - returns request info
-  server.get("/get", async (request, reply) => {
+  server.get("/get", async (request) => {
     return {
       args: request.query,
       headers: request.headers,
@@ -83,7 +83,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // POST endpoint - returns request info with body
-  server.post("/post", async (request, reply) => {
+  server.post("/post", async (request) => {
     let data = "";
     let json = null;
     let form: Record<string, string> = {};
@@ -117,7 +117,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // PUT endpoint
-  server.put("/put", async (request, reply) => {
+  server.put("/put", async (request) => {
     return {
       args: request.query,
       data: typeof request.body === "string" ? request.body : JSON.stringify(request.body),
@@ -129,7 +129,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // DELETE endpoint
-  server.delete("/delete", async (request, reply) => {
+  server.delete("/delete", async (request) => {
     return {
       args: request.query,
       headers: request.headers,
@@ -139,7 +139,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // PATCH endpoint
-  server.patch("/patch", async (request, reply) => {
+  server.patch("/patch", async (request) => {
     return {
       args: request.query,
       data: typeof request.body === "string" ? request.body : JSON.stringify(request.body),
@@ -151,7 +151,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // Headers endpoint - returns only headers
-  server.get("/headers", async (request, reply) => {
+  server.get("/headers", async (request) => {
     return {
       headers: request.headers,
     };
@@ -233,7 +233,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // Delay endpoint - delays response
-  server.get<{ Params: { seconds: string } }>("/delay/:seconds", async (request, reply) => {
+  server.get<{ Params: { seconds: string } }>("/delay/:seconds", async (request) => {
     const seconds = parseFloat(request.params.seconds);
     if (process.env.IMPERS_DEBUG_TESTS === "1") {
       console.log(`[mock-server] delay start seconds=${seconds}`);
@@ -294,7 +294,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // Cookies endpoint - returns cookies
-  server.get("/cookies", async (request, reply) => {
+  server.get("/cookies", async (request) => {
     return {
       cookies: request.cookies || {},
     };
@@ -324,7 +324,7 @@ export async function startMockServer(port = 0): Promise<number> {
   });
 
   // Anything endpoint - accepts any method and returns details
-  server.all("/anything", async (request, reply) => {
+  server.all("/anything", async (request) => {
     return {
       method: request.method,
       args: request.query,

@@ -7,7 +7,7 @@
  * Then run this example:
  *   npx tsx examples/websocket.ts
  */
-import { wsConnect, WebSocketMessageType } from "impers";
+import { wsConnect } from "impers";
 
 async function main() {
   const port = process.argv[2] || "8765";

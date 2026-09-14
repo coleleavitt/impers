@@ -27,7 +27,7 @@ async function main() {
     console.log("   Impersonating Chrome 124:");
     const data1 = response1.json() as { tls?: { ja3_hash?: string } };
     console.log(`   JA3 Hash: ${data1.tls?.ja3_hash || "N/A"}\n`);
-  } catch (e) {
+  } catch {
     console.log("   (Impersonation requires curl-impersonate)\n");
   }
 

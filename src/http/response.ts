@@ -3,9 +3,9 @@
  */
 
 import { Headers } from "./headers.js";
-import { Cookies, type Cookie } from "./cookies.js";
+import { Cookies } from "./cookies.js";
 import { Curl } from "../core/easy.js";
-import { CurlInfo, CurlHttpVersion } from "../ffi/constants.js";
+import { CurlHttpVersion } from "../ffi/constants.js";
 import { HTTPError } from "../utils/errors.js";
 
 export interface ResponseInit {
@@ -19,6 +19,8 @@ export interface ResponseInit {
   statusCode?: number;
   statusText?: string;
   url?: string;
+  stream?: AsyncIterable<Buffer>;
+  close?: () => void | Promise<void>;
 }
 
 /**
@@ -57,16 +59,20 @@ export class Response {
   private _stream: AsyncIterable<Buffer> | null = null;
   private _encoding: BufferEncoding = "utf-8";
   private readonly _statusText: string | null = null;
+  private _close: (() => void | Promise<void>) | null = null;
+  private _closed = false;
 
   constructor(init: ResponseInit) {
     this.requestUrl = init.requestUrl || "";
     this.history = init.history || [];
     this.elapsed = init.elapsed || 0;
 
-    // Set content if provided
-    if (init.content) {
+    // Set buffered or streaming content if provided.
+    if (init.content !== undefined) {
       this._content = init.content;
     }
+    this._stream = init.stream ?? null;
+    this._close = init.close ?? null;
 
     // Use pre-parsed headers if provided, otherwise parse from raw
     if (init.headers) {
@@ -349,8 +355,11 @@ export class Response {
    * Close the response (cleanup resources)
    */
   async close(): Promise<void> {
-    // Nothing to do for buffered responses
-    // Streaming responses would need cleanup here
+    if (this._closed) return;
+    this._closed = true;
+    const close = this._close;
+    this._close = null;
+    await close?.();
   }
 
   /**

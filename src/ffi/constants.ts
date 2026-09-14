@@ -6,21 +6,8 @@
 // Option type bases
 const CURLOPTTYPE_LONG = 0;
 const CURLOPTTYPE_OBJECTPOINT = 10000;
-const CURLOPTTYPE_FUNCTIONPOINT = 20000;
-const CURLOPTTYPE_OFF_T = 30000;
-const CURLOPTTYPE_BLOB = 40000;
 const CURLOPTTYPE_STRINGPOINT = CURLOPTTYPE_OBJECTPOINT;
 const CURLOPTTYPE_SLISTPOINT = CURLOPTTYPE_OBJECTPOINT;
-const CURLOPTTYPE_CBPOINT = CURLOPTTYPE_OBJECTPOINT;
-
-// Info type bases
-const CURLINFO_STRING = 0x100000;
-const CURLINFO_LONG = 0x200000;
-const CURLINFO_DOUBLE = 0x300000;
-const CURLINFO_SLIST = 0x400000;
-const CURLINFO_PTR = 0x400000;
-const CURLINFO_SOCKET = 0x500000;
-const CURLINFO_OFF_T = 0x600000;
 
 /**
  * CURLcode - Error codes returned by libcurl functions
@@ -714,6 +701,18 @@ export type CurlCSelect = (typeof CurlCSelect)[keyof typeof CurlCSelect];
  * Special socket value for timeout
  */
 export const CURL_SOCKET_TIMEOUT = -1;
+
+
+/** Special return value from a write callback that pauses receiving. */
+export const CURL_WRITEFUNC_PAUSE = 0x10000001;
+
+/** Bitmask values accepted by curl_easy_pause. */
+export const CurlPause = {
+  CURLPAUSE_RECV: 1 << 0,
+  CURLPAUSE_SEND: 1 << 2,
+  CURLPAUSE_ALL: (1 << 0) | (1 << 2),
+  CURLPAUSE_CONT: 0,
+} as const;
 
 /**
  * WebSocket flags
