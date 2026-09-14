@@ -479,6 +479,11 @@ export const loadedLibcurlInfo: Readonly<LoadedLibcurlInfo> = Object.freeze({
   hasCurlEasyImpersonate: curl_easy_impersonate !== null,
 });
 
+/** Report capabilities of the native libcurl handle loaded by this module. */
+async function isUsingImpersonate(): Promise<boolean> {
+  return loadedLibcurlInfo.hasCurlEasyImpersonate;
+}
+
 // ============================================================================
 // Exports
 // ============================================================================
@@ -559,6 +564,7 @@ export {
   // Impersonation
   curl_easy_impersonate,
   hasImpersonateSupport,
+  isUsingImpersonate,
   // Utility
   getHandleAddress,
 };

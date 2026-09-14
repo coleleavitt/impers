@@ -4,19 +4,21 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   realpathSync,
   readFileSync,
   renameSync,
-  rmSync,
+  rmdirSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "fs";
 import { homedir } from "os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { createHash } from "node:crypto";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve } from "path";
+import { createHash, randomBytes } from "node:crypto";
 import https from "node:https";
 import { gunzipSync, inflateRawSync } from "node:zlib";
 
@@ -139,6 +141,126 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type PathIdentity = { dev: bigint; ino: bigint };
+
+function pathIdentity(path: string): PathIdentity {
+  const stat = lstatSync(path, { bigint: true });
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function hasIdentity(path: string, identity: PathIdentity): boolean {
+  try {
+    const current = pathIdentity(path);
+    return current.dev === identity.dev && current.ino === identity.ino;
+  } catch {
+    return false;
+  }
+}
+
+function validateDirectoryAncestors(path: string): void {
+  const absolute = resolve(path);
+  const root = parse(absolute).root;
+  const components = relative(root, absolute).split(/[\\/]/).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    if (!existsSync(current)) {
+      continue;
+    }
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Unsafe cache ancestor: ${current}`);
+    }
+  }
+}
+
+function ensurePrivateDirectory(path: string): void {
+  const absolute = resolve(path);
+  validateDirectoryAncestors(absolute);
+  const root = parse(absolute).root;
+  const components = relative(root, absolute).split(/[\\/]/).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    if (!existsSync(current)) {
+      mkdirSync(current, { mode: 0o700 });
+    }
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Unsafe cache directory: ${current}`);
+    }
+  }
+
+  const stat = lstatSync(absolute);
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`Cache directory is not owned by the current user: ${absolute}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`Cache directory is not private: ${absolute}`);
+  }
+}
+
+function removeCreatedTree(path: string, identity: PathIdentity): void {
+  if (!hasIdentity(path, identity)) {
+    throw new Error(`Refusing to clean up replaced cache path: ${path}`);
+  }
+  for (const entry of readdirSync(path)) {
+    const child = join(path, entry);
+    const stat = lstatSync(child, { bigint: true });
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      removeCreatedTree(child, { dev: stat.dev, ino: stat.ino });
+    } else {
+      unlinkSync(child);
+    }
+  }
+  if (!hasIdentity(path, identity)) {
+    throw new Error(`Refusing to clean up replaced cache path: ${path}`);
+  }
+  rmdirSync(path);
+}
+
+function removeLockDirectory(lockDir: string, identity: PathIdentity, owner: string): void {
+  if (!hasIdentity(lockDir, identity)) {
+    throw new Error(`Refusing to remove replaced cache lock: ${lockDir}`);
+  }
+  const entries = readdirSync(lockDir);
+  if (entries.length !== 1 || entries[0] !== "owner") {
+    throw new Error(`Refusing to remove an unrecognized cache lock: ${lockDir}`);
+  }
+  const ownerPath = join(lockDir, "owner");
+  const ownerStat = lstatSync(ownerPath, { bigint: true });
+  const ownerIdentity = { dev: ownerStat.dev, ino: ownerStat.ino };
+  if (!ownerStat.isFile() || ownerStat.isSymbolicLink() || readFileSync(ownerPath, "utf8") !== owner ||
+      !hasIdentity(ownerPath, ownerIdentity)) {
+    throw new Error(`Refusing to remove a replaced cache lock owner: ${ownerPath}`);
+  }
+  unlinkSync(ownerPath);
+  if (!hasIdentity(lockDir, identity)) {
+    throw new Error(`Refusing to remove replaced cache lock: ${lockDir}`);
+  }
+  rmdirSync(lockDir);
+}
+
+function removeStaleLock(lockDir: string): boolean {
+  try {
+    const stat = lstatSync(lockDir, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+    if (typeof process.getuid === "function" && Number(stat.uid) !== process.getuid()) return false;
+    if ((Number(stat.mode) & 0o077) !== 0) return false;
+    const identity = { dev: stat.dev, ino: stat.ino };
+    const entries = readdirSync(lockDir);
+    if (entries.length !== 1 || entries[0] !== "owner") return false;
+    const ownerPath = join(lockDir, "owner");
+    const ownerStat = lstatSync(ownerPath);
+    if (!ownerStat.isFile() || ownerStat.isSymbolicLink()) return false;
+    const owner = readFileSync(ownerPath, "utf8");
+    removeLockDirectory(lockDir, identity, owner);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function withCacheLock<T>(
   cacheRoot: string,
   platform: string,
@@ -147,23 +269,42 @@ async function withCacheLock<T>(
 ): Promise<T> {
   const lockDir = getCacheLockDir(cacheRoot, platform, arch);
   const started = Date.now();
-  let locked = false;
+  const owner = `${process.pid}:${randomBytes(16).toString("hex")}\n`;
+  let lockIdentity: PathIdentity | null = null;
 
-  while (!locked) {
+  while (!lockIdentity) {
     try {
-      mkdirSync(lockDir);
-      writeFileSync(join(lockDir, "owner"), `${process.pid}\n`);
-      locked = true;
+      mkdirSync(lockDir, { mode: 0o700 });
+      lockIdentity = pathIdentity(lockDir);
+      const ownerFd = openSync(
+        join(lockDir, "owner"),
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+        0o600
+      );
+      try {
+        writeFileSync(ownerFd, owner);
+      } finally {
+        closeSync(ownerFd);
+      }
     } catch {
+      if (lockIdentity) {
+        try {
+          removeCreatedTree(lockDir, lockIdentity);
+        } catch {
+          // Leave a replaced or otherwise untrusted lock untouched.
+        }
+        lockIdentity = null;
+      }
       let stale = false;
       try {
-        stale = Date.now() - statSync(lockDir).mtimeMs > CACHE_LOCK_STALE_MS;
+        const stat = lstatSync(lockDir);
+        stale = !stat.isSymbolicLink() && stat.isDirectory() &&
+          Date.now() - stat.mtimeMs > CACHE_LOCK_STALE_MS;
       } catch {
         stale = false;
       }
 
-      if (stale) {
-        rmSync(lockDir, { recursive: true, force: true });
+      if (stale && removeStaleLock(lockDir)) {
         continue;
       }
 
@@ -178,7 +319,7 @@ async function withCacheLock<T>(
   try {
     return await fn();
   } finally {
-    rmSync(lockDir, { recursive: true, force: true });
+    removeLockDirectory(lockDir, lockIdentity, owner);
   }
 }
 
@@ -439,26 +580,22 @@ async function tryDownloadImpersonate(
     return null;
   }
 
-  mkdirSync(join(cacheRoot, LIBCURL_IMPERSONATE_VERSION), { recursive: true });
-
-  try {
-    return await withCacheLock(cacheRoot, platform, arch, async () => {
-      const cachedAfterLock = findCachedLibrary(cacheRoot, platform, arch, libraryDigest);
-      if (cachedAfterLock) {
-        return cachedAfterLock;
-      }
-      return await downloadImpersonate(
-        cacheRoot,
-        platform,
-        arch,
-        assetDigest,
-        libraryDigest,
-        env
-      );
-    });
-  } catch {
-    return findCachedLibrary(cacheRoot, platform, arch, libraryDigest);
-  }
+  ensurePrivateDirectory(cacheRoot);
+  ensurePrivateDirectory(join(cacheRoot, LIBCURL_IMPERSONATE_VERSION));
+  return withCacheLock(cacheRoot, platform, arch, async () => {
+    const cachedAfterLock = findCachedLibrary(cacheRoot, platform, arch, libraryDigest);
+    if (cachedAfterLock) {
+      return cachedAfterLock;
+    }
+    return downloadImpersonate(
+      cacheRoot,
+      platform,
+      arch,
+      assetDigest,
+      libraryDigest,
+      env
+    );
+  });
 }
 
 async function downloadImpersonate(
@@ -494,18 +631,36 @@ async function downloadImpersonate(
     throw new Error("No libcurl-impersonate binary found in release asset");
   }
 
-  rmSync(targetDir, { recursive: true, force: true });
-  mkdirSync(targetDir, { recursive: true });
+  const targetParent = dirname(targetDir);
+  validateDirectoryAncestors(targetParent);
+  ensurePrivateDirectory(targetParent);
+  if (existsSync(targetDir)) {
+    throw new Error(`Refusing to replace existing cache target: ${targetDir}`);
+  }
+
+  const tempDir = mkdtempSync(join(targetParent, `.${basename(targetDir)}.tmp-`));
+  const tempIdentity = pathIdentity(tempDir);
+  let published = false;
   try {
-    writeExtractedEntries(extracted, targetDir, platform);
-    const resolved = findCachedLibrary(cacheRoot, platform, arch, expectedLibraryDigest);
-    if (!resolved) {
+    writeExtractedEntries(extracted, tempDir, platform);
+    const candidates = collectLibraryCandidates(tempDir, libExt);
+    const resolvedTemp = candidates.find((candidate) =>
+      isVerifiedRegularFile(candidate, tempDir, expectedLibraryDigest)
+    );
+    if (!resolvedTemp) {
       throw new Error("Extracted libcurl-impersonate failed SHA-256 verification");
     }
-    return resolved;
-  } catch (error) {
-    rmSync(targetDir, { recursive: true, force: true });
-    throw error;
+    if (existsSync(targetDir)) {
+      throw new Error(`Refusing to replace existing cache target: ${targetDir}`);
+    }
+    const relativeLibraryPath = relative(tempDir, resolvedTemp);
+    renameSync(tempDir, targetDir);
+    published = true;
+    return join(targetDir, relativeLibraryPath);
+  } finally {
+    if (!published && existsSync(tempDir)) {
+      removeCreatedTree(tempDir, tempIdentity);
+    }
   }
 }
 
@@ -1004,13 +1159,6 @@ export async function resolveLibrary(
  */
 export async function resolveLibcurlPath(): Promise<string> {
   return (await resolveLibrary()).path;
-}
-
-/**
- * Check if we're using curl-impersonate
- */
-export async function isUsingImpersonate(): Promise<boolean> {
-  return (await resolveLibrary()).isImpersonate;
 }
 
 /**

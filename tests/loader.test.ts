@@ -8,6 +8,7 @@ import {
 } from "../src/ffi/loader.js";
 import {
   hasImpersonateSupport,
+  isUsingImpersonate,
   loadedLibcurlInfo,
   loadedLibcurlPath,
   type LoadedLibcurlInfo,
@@ -29,7 +30,7 @@ const digest = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
 
 describe("libcurl loader", () => {
-  it("reports immutable details for the loaded native library", () => {
+  it("reports immutable details for the loaded native library", async () => {
     const info: Readonly<LoadedLibcurlInfo> = loadedLibcurlInfo;
 
     expect(Object.isFrozen(info)).toBe(true);
@@ -37,6 +38,20 @@ describe("libcurl loader", () => {
       path: loadedLibcurlPath,
       hasCurlEasyImpersonate: hasImpersonateSupport(),
     });
+
+    const previousPath = process.env.LIBCURL_IMPERSONATE_PATH;
+    process.env.LIBCURL_IMPERSONATE_PATH = "/does/not/exist/libcurl-impersonate.so";
+    try {
+      await expect(isUsingImpersonate()).resolves.toBe(
+        info.hasCurlEasyImpersonate
+      );
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env.LIBCURL_IMPERSONATE_PATH;
+      } else {
+        process.env.LIBCURL_IMPERSONATE_PATH = previousPath;
+      }
+    }
   });
 
   it("pins the curl-impersonate release", () => {
@@ -156,6 +171,56 @@ describe("libcurl loader", () => {
       expect(existsSync(join(root, "cache", LIBCURL_IMPERSONATE_VERSION))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a download through a symlink cache root without touching its target", async () => {
+    const root = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    const outsideDir = join(root, "outside");
+    const cacheRoot = join(root, "cache");
+    const sentinel = join(outsideDir, "sentinel");
+    mkdirSync(outsideDir, { mode: 0o700 });
+    writeFileSync(sentinel, "preserve me");
+    symlinkSync(outsideDir, cacheRoot, "dir");
+
+    try {
+      await expect(resolveLibrary({
+        env: {
+          IMPER_CACHE_DIR: cacheRoot,
+          IMPER_DOWNLOAD_LIBCURL: "1",
+          IMPER_LIBCURL_ASSET_SHA256: digest("archive"),
+          IMPER_LIBCURL_SHA256: digest("library"),
+          IMPER_LIBCURL_RELEASE_URL: "https://invalid.invalid/must-not-be-fetched",
+        },
+        platform: "linux",
+        arch: "x64",
+        impersonateSearchPaths: [],
+      })).rejects.toThrow(/Unsafe cache (?:directory|ancestor)/);
+
+      expect(readFileSync(sentinel, "utf8")).toBe("preserve me");
+      expect(existsSync(join(outsideDir, LIBCURL_IMPERSONATE_VERSION))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an opted-in verified download fails", async () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    try {
+      await expect(resolveLibrary({
+        env: {
+          IMPER_CACHE_DIR: cacheRoot,
+          IMPER_DOWNLOAD_LIBCURL: "1",
+          IMPER_LIBCURL_ASSET_SHA256: digest("expected archive"),
+          IMPER_LIBCURL_SHA256: digest("expected library"),
+          IMPER_LIBCURL_RELEASE_URL: "https://invalid.invalid/download-must-fail",
+        },
+        platform: "linux",
+        arch: "x64",
+        impersonateSearchPaths: [],
+      })).rejects.toThrow();
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
     }
   });
 

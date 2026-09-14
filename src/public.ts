@@ -163,6 +163,7 @@ export {
   loadedLibcurlInfo,
   loadedLibcurlPath,
   hasImpersonateSupport,
+  isUsingImpersonate,
   type LoadedLibcurlInfo,
 } from "./ffi/libcurl.js";
 export { CurlMime } from "./core/mime.js";
@@ -195,7 +196,6 @@ export {
 export {
   resolveLibcurlPath,
   resolveLibrary,
-  isUsingImpersonate,
   getPlatformInfo,
   type LibraryInfo,
 } from "./utils/platform.js";

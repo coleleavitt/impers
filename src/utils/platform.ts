@@ -2,7 +2,6 @@
 export {
   resolveLibcurlPath,
   resolveLibrary,
-  isUsingImpersonate,
   getPlatformInfo,
   type LibraryInfo,
 } from "../ffi/loader.js";
