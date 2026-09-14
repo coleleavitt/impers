@@ -18,7 +18,7 @@ import {
   type CurlHandle,
   type CurlMultiHandle,
 } from "../ffi/libcurl.js";
-import { CurlOpt, CurlCode, CurlWsFlag, CurlWsOpt } from "../ffi/constants.js";
+import { CurlOpt, CurlCode, CurlMCode, CurlWsFlag, CurlWsOpt } from "../ffi/constants.js";
 import { WebSocketError, WebSocketClosed, ImpersonateError } from "../utils/errors.js";
 import { Headers } from "../http/headers.js";
 import { Cookies } from "../http/cookies.js";
@@ -30,6 +30,9 @@ const CONNECT_POLL_MS = 1;
 
 /** `CURLMSG_DONE` — the only message type curl's multi interface defines. */
 const CURLMSG_DONE = 1;
+
+/** Avoid letting an unbounded run of control frames monopolize one receive poll. */
+const MAX_CONTROL_FRAMES_PER_POLL = 100;
 
 /**
  * WebSocket message types
@@ -76,10 +79,13 @@ export class AsyncWebSocket {
 
   private receiveBuffer: Buffer;
   private messageQueue: WebSocketMessage[] = [];
+  private fragmentedMessage: { data: Buffer; flags: number; received: number } | null = null;
 
   private multi: CurlMultiHandle | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private pollInterval: number = 10; // ms between polls
+  private resourcesReleased = false;
+  private handleAddedToMulti = false;
 
   private maxMessageSize: number;
 
@@ -92,70 +98,48 @@ export class AsyncWebSocket {
     this.maxMessageSize = options.maxMessageSize || 64 * 1024 * 1024; // 64MB default
     this.receiveBuffer = Buffer.alloc(Math.min(this.maxMessageSize, 1024 * 1024)); // Start with 1MB
 
-    // Create curl handle
     this.curl = new Curl();
     this.handle = this.curl.getHandle()!;
 
-    // Configure WebSocket URL (curl expects ws:// or wss:// scheme)
-    this.curl.setOpt(CurlOpt.URL, url);
+    try {
+      this.curl.setOpt(CurlOpt.URL, url);
+      this.curl.setOpt(CurlOpt.CONNECT_ONLY, 2);
+      this.curl.setOpt(CurlOpt.WS_OPTIONS, CurlWsOpt.CURLWS_NOAUTOPONG);
 
-    // Enable WebSocket upgrade
-    this.curl.setOpt(CurlOpt.CONNECT_ONLY, 2); // 2 = WebSocket mode
-
-    // Answer pings here rather than letting libcurl do it.
-    //
-    // libcurl's automatic pong is queued and only written on the next application send;
-    // receiving does not flush it. A consumer that only reads — the normal shape for a
-    // subscription — therefore never delivers a pong at all, and a server that enforces a
-    // pong deadline closes the connection with no error until the next receive.
-    //
-    // With CURLWS_NOAUTOPONG the ping is delivered to `curl_ws_recv` instead, and the reply
-    // goes out from `tryReceive` as an ordinary send: immediately, echoing the ping's
-    // payload, which is what RFC 6455 asks for and what a browser does.
-    this.curl.setOpt(CurlOpt.WS_OPTIONS, CurlWsOpt.CURLWS_NOAUTOPONG);
-
-    // Impersonation first: it configures the TLS and HTTP/2 layers, and — unless default
-    // headers are turned off — installs the browser's own header list, which would replace
-    // anything set before it. The caller's headers go on afterwards so they win.
-    if (typeof options.impersonate === "string") {
-      const target = resolveNativeImpersonateTarget(options.impersonate);
-      if (!target) {
-        throw new ImpersonateError(`Impersonating ${options.impersonate} is not supported`);
+      if (typeof options.impersonate === "string") {
+        const target = resolveNativeImpersonateTarget(options.impersonate);
+        if (!target) {
+          throw new ImpersonateError(`Impersonating ${options.impersonate} is not supported`);
+        }
+        try {
+          this.curl.impersonate(target, options.defaultHeaders !== false);
+        } catch (error) {
+          throw new ImpersonateError(
+            `Impersonating ${target} is not supported`,
+            error instanceof Error ? error : undefined
+          );
+        }
       }
-      try {
-        this.curl.impersonate(target, options.defaultHeaders !== false);
-      } catch (error) {
-        throw new ImpersonateError(
-          `Impersonating ${target} is not supported`,
-          error instanceof Error ? error : undefined
-        );
+
+      if (options.headers) {
+        this.curl.setHeaders(new Headers(options.headers).toCurlHeaders());
       }
-    }
 
-    // Set headers
-    if (options.headers) {
-      this.curl.setHeaders(new Headers(options.headers).toCurlHeaders());
-    }
-
-    // Set cookies
-    if (options.cookies) {
-      const cookieHeader = new Cookies(options.cookies).toCookieHeader();
-      if (cookieHeader) {
-        this.curl.setOpt(CurlOpt.COOKIE, cookieHeader);
+      if (options.cookies) {
+        const cookieHeader = new Cookies(options.cookies).toCookieHeader();
+        if (cookieHeader) this.curl.setOpt(CurlOpt.COOKIE, cookieHeader);
       }
-    }
 
-    // Set proxy
-    if (options.proxy) {
-      this.curl.setOpt(CurlOpt.PROXY, options.proxy);
-    }
+      if (options.proxy) this.curl.setOpt(CurlOpt.PROXY, options.proxy);
 
-    // Set SSL verification
-    this.curl.setOpt(CurlOpt.SSL_VERIFYPEER, options.verify === false ? 0 : 1);
+      const verify = options.verify === false ? 0 : 1;
+      this.curl.setOpt(CurlOpt.SSL_VERIFYPEER, verify);
+      this.curl.setOpt(CurlOpt.SSL_VERIFYHOST, options.verify === false ? 0 : 2);
 
-    // Set timeout
-    if (options.timeout) {
-      this.curl.setOpt(CurlOpt.TIMEOUT, options.timeout);
+      if (options.timeout) this.curl.setOpt(CurlOpt.TIMEOUT, options.timeout);
+    } catch (error) {
+      this.cleanupResources();
+      throw error;
     }
   }
 
@@ -194,7 +178,11 @@ export class AsyncWebSocket {
     try {
       this.multi = curl_multi_init();
       if (!this.multi) throw new WebSocketError("Failed to initialize curl multi handle");
-      curl_multi_add_handle(this.multi, this.handle);
+      const addCode = curl_multi_add_handle(this.multi, this.handle);
+      if (addCode !== CurlMCode.CURLM_OK) {
+        throw new WebSocketError(`Failed to add WS handle to multi: ${addCode}`);
+      }
+      this.handleAddedToMulti = true;
 
       let running = 1;
       while (running > 0) {
@@ -213,8 +201,11 @@ export class AsyncWebSocket {
       this._connected = true;
     } catch (error) {
       this._closed = true;
-      this.releaseMulti();
-      this.curl.cleanup();
+      try {
+        this.cleanupResources();
+      } catch {
+        // Preserve the connection/setup error that caused cleanup.
+      }
       if (error instanceof WebSocketError) throw error;
       throw new WebSocketError(`Failed to connect: ${error}`);
     }
@@ -222,11 +213,10 @@ export class AsyncWebSocket {
 
   /** The completion code the multi recorded for this transfer, once it stopped running. */
   private readTransferResult(): number {
-    if (!this.multi) return CurlCode.CURLE_OK;
+    if (!this.multi) throw new WebSocketError("WS transfer completed without a multi handle");
     for (;;) {
       const { message } = curl_multi_info_read(this.multi);
-      if (!message) return CurlCode.CURLE_OK;
-      // CURLMSG_DONE is the only message curl defines, and it carries the easy result.
+      if (!message) throw new WebSocketError("WS transfer completed without CURLMSG_DONE");
       if (message.msg === CURLMSG_DONE) return message.result;
     }
   }
@@ -236,8 +226,36 @@ export class AsyncWebSocket {
     if (!this.multi) return;
     const multi = this.multi;
     this.multi = null;
-    curl_multi_remove_handle(multi, this.handle);
-    curl_multi_cleanup(multi);
+    let failure: WebSocketError | null = null;
+
+    if (this.handleAddedToMulti) {
+      this.handleAddedToMulti = false;
+      const removeCode = curl_multi_remove_handle(multi, this.handle);
+      if (removeCode !== CurlMCode.CURLM_OK) {
+        failure = new WebSocketError(`Failed to remove WS handle from multi: ${removeCode}`);
+      }
+    }
+
+    const cleanupCode = curl_multi_cleanup(multi);
+    if (cleanupCode !== CurlMCode.CURLM_OK && !failure) {
+      failure = new WebSocketError(`Failed to clean up WS multi handle: ${cleanupCode}`);
+    }
+    if (failure) throw failure;
+  }
+
+  /** Release all native resources exactly once. */
+  private cleanupResources(): void {
+    if (this.resourcesReleased) return;
+    this.resourcesReleased = true;
+    let failure: unknown;
+    try {
+      this.releaseMulti();
+    } catch (error) {
+      failure = error;
+    } finally {
+      this.curl.cleanup();
+    }
+    if (failure) throw failure;
   }
 
   /**
@@ -274,50 +292,80 @@ export class AsyncWebSocket {
    * Throws on error
    */
   private tryReceive(): WebSocketMessage | null {
-    if (this._closed) {
-      return null;
-    }
+    if (this._closed) return null;
 
-    const { code, received, frame } = curl_ws_recv(this.handle, this.receiveBuffer);
+    for (let controlFrames = 0; controlFrames < MAX_CONTROL_FRAMES_PER_POLL; controlFrames++) {
+      const { code, received, frame } = curl_ws_recv(this.handle, this.receiveBuffer);
+      if (code === CurlCode.CURLE_AGAIN) return null;
+      if (code !== CurlCode.CURLE_OK) throw new WebSocketError(`Receive error: ${code}`);
+      if (received === 0 && frame === null) return null;
 
-    // `received > 0` alone would discard every zero-length frame. An empty payload is
-    // perfectly ordinary — it is what a keepalive ping, a bare close, and an empty text
-    // message all look like — and dropping it means never answering a ping that carries no
-    // payload, which is the common case. What distinguishes "nothing to read" from "a frame
-    // with no payload" is the frame metadata, not the byte count.
-    if (code === CurlCode.CURLE_OK && (received > 0 || frame !== null)) {
-      // Process the received frame
-      const data = Buffer.from(this.receiveBuffer.subarray(0, received));
-      // Default to TEXT if no frame info available
       const flags = frame?.flags ?? CurlWsFlag.CURLWS_TEXT;
-      const message = this.frameToMessage(data, flags);
-
-      if (message) {
-        // Handle close frame
-        if (message.type === WebSocketMessageType.CLOSE) {
-          this.handleCloseFrame(message.data);
-          throw new WebSocketClosed(
-            this._closeEvent?.code || 1000,
-            this._closeEvent?.reason || ""
-          );
-        }
-
-        // Answer a ping and keep reading. It is deliberately not returned: libcurl used to
-        // absorb pings entirely, so surfacing them now would put frames into a stream that
-        // has never carried them.
-        if (message.type === WebSocketMessageType.PING) {
-          this.sendPong(message.data).catch(() => {});
-          return this.tryReceive();
-        }
-
-        return message;
+      const offset = Number(frame?.offset ?? 0n);
+      const bytesLeft = Number(frame?.bytesleft ?? 0n);
+      const totalLength = offset + received + bytesLeft;
+      if (!Number.isSafeInteger(totalLength) || totalLength > this.maxMessageSize) {
+        throw new WebSocketError(`WebSocket frame exceeds maximum size of ${this.maxMessageSize} bytes`);
       }
-    } else if (code === CurlCode.CURLE_AGAIN) {
-      // No data available
-      return null;
-    } else if (code !== CurlCode.CURLE_OK) {
-      // Error occurred
-      throw new WebSocketError(`Receive error: ${code}`);
+
+      let data: Buffer;
+      let messageFlags = flags;
+      if (offset === 0 && bytesLeft === 0) {
+        data = Buffer.from(this.receiveBuffer.subarray(0, received));
+      } else {
+        if (offset === 0) {
+          this.fragmentedMessage = {
+            data: Buffer.alloc(totalLength),
+            flags,
+            received: 0,
+          };
+        }
+        const fragmented = this.fragmentedMessage;
+        if (!fragmented || offset !== fragmented.received || totalLength !== fragmented.data.length) {
+          this.fragmentedMessage = null;
+          throw new WebSocketError("Received inconsistent fragmented WebSocket frame metadata");
+        }
+        this.receiveBuffer.copy(fragmented.data, offset, 0, received);
+        fragmented.received += received;
+        if (bytesLeft > 0) return null;
+        data = fragmented.data;
+        messageFlags = fragmented.flags;
+        this.fragmentedMessage = null;
+      }
+
+      const message = this.frameToMessage(data, messageFlags);
+      if (!message) continue;
+
+      if (message.type === WebSocketMessageType.CLOSE) {
+        this.handleCloseFrame(message.data);
+        try {
+          this.cleanupResources();
+        } catch (error) {
+          throw error instanceof Error ? error : new WebSocketError(String(error));
+        }
+        throw new WebSocketClosed(
+          this._closeEvent?.code || 1000,
+          this._closeEvent?.reason || ""
+        );
+      }
+
+      if (message.type === WebSocketMessageType.PING) {
+        try {
+          this.sendPongNow(message.data);
+        } catch (error) {
+          this._closed = true;
+          this._connected = false;
+          try {
+            this.cleanupResources();
+          } catch {
+            // Keep the auto-pong error as the cause visible to the caller.
+          }
+          throw error;
+        }
+        continue;
+      }
+
+      return message;
     }
 
     return null;
@@ -535,9 +583,15 @@ export class AsyncWebSocket {
     await this.sendRaw(buffer, CurlWsFlag.CURLWS_PONG);
   }
 
-  /** Answer a received ping. Kept separate so the auto-reply path reads as what it is. */
-  private async sendPong(data: Buffer): Promise<void> {
-    await this.sendRaw(data, CurlWsFlag.CURLWS_PONG);
+  /** Answer a received ping synchronously so failures surface in the active receive. */
+  private sendPongNow(data: Buffer): void {
+    const { code, sent } = curl_ws_send(this.handle, data, CurlWsFlag.CURLWS_PONG);
+    if (code !== CurlCode.CURLE_OK) {
+      throw new WebSocketError(`Automatic pong failed with code ${code}`);
+    }
+    if (sent !== data.length) {
+      throw new WebSocketError(`Incomplete automatic pong: ${sent}/${data.length} bytes`);
+    }
   }
 
   /**
@@ -569,8 +623,7 @@ export class AsyncWebSocket {
     }
 
     // Cleanup
-    this.releaseMulti();
-    this.curl.cleanup();
+    this.cleanupResources();
   }
 
   /**

@@ -24,9 +24,23 @@ const OPCODE_TEXT = 0x1;
 const OPCODE_BINARY = 0x2;
 const OPCODE_CLOSE = 0x8;
 
-/** A single unfragmented server frame. Payloads here are always well under 126 bytes. */
+/** A single unfragmented server frame. */
 function frame(opcode: number, payload: Buffer): Buffer {
-  return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
+  let header: Buffer;
+  if (payload.length < 126) {
+    header = Buffer.from([0x80 | opcode, payload.length]);
+  } else if (payload.length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+  }
+  return Buffer.concat([header, payload]);
 }
 
 let server: Server;
@@ -44,6 +58,10 @@ beforeAll(async () => {
       "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
+    if (request.url === "/large") {
+      socket.write(frame(OPCODE_BINARY, Buffer.alloc(2 * 1024 * 1024 + 17, 0xa5)));
+      return;
+    }
     socket.write(frame(OPCODE_TEXT, Buffer.from("hello")));
     socket.write(frame(OPCODE_BINARY, Buffer.from([1, 2, 3])));
     socket.write(frame(OPCODE_CLOSE, Buffer.from([0x03, 0xe9]))); // 1001, Going Away
@@ -73,5 +91,22 @@ describe("received frame types", () => {
     await expect(ws.recv(5)).rejects.toThrow(WebSocketClosed);
     expect(ws.closed).toBe(true);
     expect(ws.closeEvent?.code).toBe(1001);
+
+    // Remote close has already released both native handles. Later closes stay safe.
+    await ws.close();
+    await ws.close();
+  });
+
+  it("reassembles a frame larger than the receive buffer", async () => {
+    const ws = await wsConnect(`ws://127.0.0.1:${port}/large`, {
+      maxMessageSize: 3 * 1024 * 1024,
+    });
+
+    const message = await ws.recv(5);
+    expect(message.type).toBe("binary");
+    expect(message.data.length).toBe(2 * 1024 * 1024 + 17);
+    expect(message.data.every((byte) => byte === 0xa5)).toBe(true);
+
+    await ws.close();
   });
 });
