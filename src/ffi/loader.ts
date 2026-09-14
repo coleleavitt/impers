@@ -103,17 +103,20 @@ function isNonEmptyFile(path: string): boolean {
     }
 };
 
-function getCacheRoot(): string | null {
-  if (process.env.IMPER_CACHE_DIR) {
-    return process.env.IMPER_CACHE_DIR;
+function getCacheRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): string | null {
+  if (env.IMPER_CACHE_DIR) {
+    return env.IMPER_CACHE_DIR;
   }
 
-  if (process.platform === "win32") {
-    const base = process.env.LOCALAPPDATA || process.env.APPDATA;
+  if (platform === "win32") {
+    const base = env.LOCALAPPDATA || env.APPDATA;
     return base ? join(base, "impers", "libcurl-impersonate") : null;
   }
 
-  const base = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+  const base = env.XDG_CACHE_HOME || join(homedir(), ".cache");
   return join(base, "impers", "libcurl-impersonate");
 }
 
@@ -183,7 +186,11 @@ function splitEnvPaths(value: string | undefined): string[] {
   return value.split(process.platform === "win32" ? ";" : ":").filter(Boolean);
 }
 
-function getSystemSearchPaths(platform: string, arch: string): string[] {
+function getSystemSearchPaths(
+  platform: string,
+  arch: string,
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
   const paths = [...(SYSTEM_LIBCURL_SEARCH_PATHS[platform] || [])];
 
   if (platform === "linux") {
@@ -193,12 +200,12 @@ function getSystemSearchPaths(platform: string, arch: string): string[] {
       ? ["/usr/lib/aarch64-linux-gnu", "/lib/aarch64-linux-gnu"]
       : [];
     paths.unshift(...archDirs);
-    paths.unshift(...splitEnvPaths(process.env.LD_LIBRARY_PATH));
+    paths.unshift(...splitEnvPaths(env.LD_LIBRARY_PATH));
   } else if (platform === "darwin") {
-    paths.unshift(...splitEnvPaths(process.env.DYLD_LIBRARY_PATH));
-    paths.unshift(...splitEnvPaths(process.env.LD_LIBRARY_PATH));
+    paths.unshift(...splitEnvPaths(env.DYLD_LIBRARY_PATH));
+    paths.unshift(...splitEnvPaths(env.LD_LIBRARY_PATH));
   } else if (platform === "win32") {
-    paths.unshift(...splitEnvPaths(process.env.PATH));
+    paths.unshift(...splitEnvPaths(env.PATH));
   }
 
   return uniquePaths(paths);
@@ -248,9 +255,13 @@ function findVersionedSystemLibrary(paths: string[], platform: string): string |
   return matches[0] || null;
 }
 
-function findSystemLibrary(platform: string, arch: string): string {
+function findSystemLibrary(
+  platform: string,
+  arch: string,
+  env: NodeJS.ProcessEnv = process.env
+): string {
   const candidates = DEFAULT_LIBCURL_CANDIDATES[platform] || ["libcurl.so.4", "libcurl.so"];
-  const searchPaths = getSystemSearchPaths(platform, arch);
+  const searchPaths = getSystemSearchPaths(platform, arch, env);
 
   const discovered = findLibraryInPaths(searchPaths, candidates)
     || findVersionedSystemLibrary(searchPaths, platform);
@@ -335,12 +346,12 @@ type ExtractedEntry = {
   type: "file" | "symlink";
 };
 
-async function tryDownloadImpersonate(platform: string, arch: string): Promise<string | null> {
-  if (process.env.IMPER_DOWNLOAD_LIBCURL === "0") {
-    return null;
-  }
-
-  const cacheRoot = getCacheRoot();
+async function tryDownloadImpersonate(
+  platform: string,
+  arch: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string | null> {
+  const cacheRoot = getCacheRoot(env, platform as NodeJS.Platform);
   if (!cacheRoot) {
     return null;
   }
@@ -348,6 +359,10 @@ async function tryDownloadImpersonate(platform: string, arch: string): Promise<s
   const cached = findCachedLibrary(cacheRoot, platform, arch);
   if (cached) {
     return cached;
+  }
+
+  if (env.IMPER_DOWNLOAD_LIBCURL === "0") {
+    return null;
   }
 
   mkdirSync(join(cacheRoot, LIBCURL_IMPERSONATE_VERSION), { recursive: true });
@@ -358,17 +373,22 @@ async function tryDownloadImpersonate(platform: string, arch: string): Promise<s
       if (cachedAfterLock) {
         return cachedAfterLock;
       }
-      return await downloadImpersonate(cacheRoot, platform, arch);
+      return await downloadImpersonate(cacheRoot, platform, arch, env);
     });
   } catch {
     return findCachedLibrary(cacheRoot, platform, arch);
   }
 }
 
-async function downloadImpersonate(cacheRoot: string, platform: string, arch: string): Promise<string> {
+async function downloadImpersonate(
+  cacheRoot: string,
+  platform: string,
+  arch: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string> {
   const libExt = PLATFORM_LIB_EXT[platform] || ".so";
   const targetDir = getCacheDir(cacheRoot, platform, arch);
-  const apiUrl = process.env.IMPER_LIBCURL_RELEASE_URL ||
+  const apiUrl = env.IMPER_LIBCURL_RELEASE_URL ||
     LIBCURL_IMPERSONATE_RELEASE_URL;
   const headers = {
     "User-Agent": "impers",
@@ -730,56 +750,66 @@ function isLibName(name: string, libPrefix: string, libExt: string): boolean {
   return base.endsWith(libExt);
 }
 
+/** Options used to make library resolution deterministic in tests and embedders. */
+export interface ResolveLibraryOptions {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  impersonateSearchPaths?: string[];
+}
+
 /**
  * Resolve libcurl library path with priority:
- * 1. LIBCURL_IMPERSONATE_PATH env var (for curl-impersonate)
- * 2. LIBCURL_PATH env var (explicit path)
- * 3. Auto-detect curl-impersonate in common locations
- * 4. Download curl-impersonate into cache (optional)
- * 5. System libcurl
+ * 1. Explicit LIBCURL_IMPERSONATE_PATH or LIBCURL_PATH
+ * 2. Verified library from the pinned-version cache
+ * 3. Download the pinned curl-impersonate release (unless disabled)
+ * 4. Auto-detected system curl-impersonate
+ * 5. System libcurl for requests that do not use impersonation
+ *
+ * A plain system libcurl is never marked as impersonation-capable.
  */
-export async function resolveLibrary(): Promise<LibraryInfo> {
-  const platform = process.platform;
-  const arch = process.arch;
+export async function resolveLibrary(
+  options: ResolveLibraryOptions = {}
+): Promise<LibraryInfo> {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
 
-  // Priority 1: Explicit curl-impersonate path
-  if (process.env.LIBCURL_IMPERSONATE_PATH) {
+  if (env.LIBCURL_IMPERSONATE_PATH) {
     return {
-      path: process.env.LIBCURL_IMPERSONATE_PATH,
+      path: env.LIBCURL_IMPERSONATE_PATH,
       isImpersonate: true,
     };
   }
 
-  // Priority 2: Explicit libcurl path (could be either)
-  if (process.env.LIBCURL_PATH) {
-    const path = process.env.LIBCURL_PATH;
-    // Heuristic: if path contains "impersonate", assume it's curl-impersonate
-    const isImpersonate = path.toLowerCase().includes("impersonate");
-    return { path, isImpersonate };
+  if (env.LIBCURL_PATH) {
+    const path = env.LIBCURL_PATH;
+    return { path, isImpersonate: path.toLowerCase().includes("impersonate") };
   }
 
-  // Priority 3: Auto-detect curl-impersonate
-  const searchPaths = IMPERSONATE_SEARCH_PATHS[platform] || [];
+  const cacheRoot = getCacheRoot(env, platform);
+  if (cacheRoot) {
+    const cachedPath = findCachedLibrary(cacheRoot, platform, arch);
+    if (cachedPath) {
+      return { path: cachedPath, isImpersonate: true };
+    }
+  }
+
+  const downloadedPath = await tryDownloadImpersonate(platform, arch, env);
+  if (downloadedPath) {
+    return { path: downloadedPath, isImpersonate: true };
+  }
+
+  const searchPaths = options.impersonateSearchPaths
+    ?? IMPERSONATE_SEARCH_PATHS[platform]
+    ?? [];
   const impersonatePath = findExistingPath(searchPaths);
   if (impersonatePath) {
-    return {
-      path: impersonatePath,
-      isImpersonate: true,
-    };
+    return { path: impersonatePath, isImpersonate: true };
   }
 
-  const downloadedPath = await tryDownloadImpersonate(platform, arch);
-  if (downloadedPath) {
-    return {
-      path: downloadedPath,
-      isImpersonate: true,
-    };
-  }
-
-  // Priority 5: System libcurl
-  const defaultLib = findSystemLibrary(platform, arch);
   return {
-    path: defaultLib,
+    path: findSystemLibrary(platform, arch, env),
     isImpersonate: false,
   };
 }
