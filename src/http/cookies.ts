@@ -312,7 +312,7 @@ export class Cookies implements Iterable<Cookie> {
 
     for (const cookie of this.cookies.values()) {
       const domain = cookie.domain || "";
-      const includeSubdomains = cookie.domain ? "TRUE" : "FALSE";
+      const includeSubdomains = cookie.domainSpecified ? "TRUE" : "FALSE";
       const path = cookie.path || "/";
       const secure = cookie.secure ? "TRUE" : "FALSE";
       const expires = cookie.expires
@@ -404,10 +404,11 @@ export class Cookies implements Iterable<Cookie> {
 
       const parts = line.split("\t");
       if (parts.length >= 7) {
-        const [domain, , path, secure, expires, name, value] = parts;
+        const [domain, includeSubdomains, path, secure, expires, name, value] = parts;
 
         cookies.set(name, value, {
           domain,
+          domainSpecified: includeSubdomains === "TRUE",
           path,
           secure: secure === "TRUE",
           expires: expires !== "0" ? new Date(parseInt(expires, 10) * 1000) : undefined,

@@ -238,6 +238,49 @@ describe("Cookies", () => {
       expect(output).toContain("example.com");
       expect(output).not.toMatch(/\t\.example\.com\t/);
     });
+
+    it("should preserve host-only and Domain scope through Netscape roundtrip", () => {
+      const cookies = new Cookies();
+      cookies.set("hostOnly", "host", {
+        domain: "api.example.com",
+        domainSpecified: false,
+      });
+      cookies.set("domainScoped", "domain", {
+        domain: "example.com",
+        domainSpecified: true,
+      });
+
+      const serialized = cookies.toNetscapeFormat();
+      expect(serialized).toContain("api.example.com\tFALSE\t/\tFALSE\t0\thostOnly\thost");
+      expect(serialized).toContain("example.com\tTRUE\t/\tFALSE\t0\tdomainScoped\tdomain");
+
+      const roundtripped = Cookies.fromNetscapeFormat(serialized);
+      expect(roundtripped.getCookie("hostOnly")?.domainSpecified).toBe(false);
+      expect(roundtripped.getCookie("domainScoped")?.domainSpecified).toBe(true);
+      expect(roundtripped.getForUrl("https://api.example.com/").map((c) => c.name)).toEqual(
+        expect.arrayContaining(["hostOnly", "domainScoped"])
+      );
+    });
+
+    it("should not leak a roundtripped host-only cookie to sibling or child subdomains", () => {
+      const cookies = new Cookies();
+      cookies.set("session", "secret", {
+        domain: "api.example.com",
+        domainSpecified: false,
+      });
+
+      const roundtripped = Cookies.fromNetscapeFormat(cookies.toNetscapeFormat());
+
+      expect(roundtripped.getForUrl("https://api.example.com/").map((c) => c.name)).toContain(
+        "session"
+      );
+      expect(roundtripped.getForUrl("https://www.example.com/").map((c) => c.name)).not.toContain(
+        "session"
+      );
+      expect(
+        roundtripped.getForUrl("https://child.api.example.com/").map((c) => c.name)
+      ).not.toContain("session");
+    });
   });
 
   describe("domainSpecified", () => {
