@@ -63,7 +63,7 @@ class ResponseBodyStream implements AsyncIterable<Buffer> {
   constructor(
     private readonly curl: Curl,
     private readonly highWaterMark: number,
-    private readonly cancel: (error: Error) => void,
+    private readonly cancel: (error: Error) => Promise<void>,
   ) {}
 
   write(chunk: Buffer): number | void {
@@ -92,11 +92,14 @@ class ResponseBodyStream implements AsyncIterable<Buffer> {
   }
 
   async close(): Promise<void> {
-    if (this.closed || this.done) return;
-    this.closed = true;
-    const error = new AbortError("Response body cancelled");
-    this.cancel(error);
-    this.fail(error);
+    if (!this.closed && !this.done) {
+      this.closed = true;
+      const error = new AbortError("Response body cancelled");
+      this.fail(error);
+      await this.cancel(error);
+      return;
+    }
+    await this.cancel(new AbortError("Response body cancelled"));
   }
 
   private wake(): void {
@@ -149,7 +152,8 @@ export class Session {
   private multi: CurlMulti;
   private ownMulti: boolean;
   private closed: boolean = false;
-  private activeTransfers = new Map<(error: Error) => void, Promise<void>>();
+  private closePromise: Promise<void> | null = null;
+  private activeTransfers = new Map<(error: Error) => void | Promise<void>, Promise<void>>();
 
   // Session defaults
   private _cookies: Cookies;
@@ -473,6 +477,8 @@ export class Session {
     const slists: SList[] = [];
     const mimes: CurlMime[] = [];
     const headerChunks: Buffer[] = [];
+    const responseSegments: ReturnType<typeof Headers.splitRawByResponse> = [];
+    let currentHeaderBlock: Buffer[] = [];
     let abortHandler: (() => void) | undefined;
     let cleaned = false;
     let callbackError: Error | null = null;
@@ -500,17 +506,20 @@ export class Session {
       curl.cleanup();
       resolveSettled();
     };
-    const cancel = (error: Error): void => {
-      if (cleaned) return;
-      this.multi.cancel(curl, error);
-      body.fail(error);
+    const cancel = async (error: Error): Promise<void> => {
+      if (!cleaned) {
+        this.multi.cancel(curl, error);
+        body.fail(error);
+      }
+      await settled;
     };
     const body = new ResponseBodyStream(curl, highWaterMark, cancel);
 
     const makeResponse = (): Response => {
       if (response) return response;
-      const rawHeaders = Buffer.concat(headerChunks);
-      const segments = Headers.splitRawByResponse(rawHeaders);
+      const segments = responseSegments.length > 0
+        ? responseSegments
+        : Headers.splitRawByResponse(Buffer.concat(headerChunks));
       if (segments.length === 0 || segments.at(-1)!.statusCode < 100) {
         throw new Error("Invalid HTTP response headers");
       }
@@ -599,12 +608,29 @@ export class Session {
           }
           mergedOptions.headerCallback?.(chunk);
           if (signal?.aborted) return 0;
-          headerChunks.push(Buffer.from(chunk));
-          if ((chunk.equals(Buffer.from("\r\n")) || chunk.equals(Buffer.from("\n")))) {
-            const statusCode = curl.getResponseCode();
+          const copy = Buffer.from(chunk);
+          headerChunks.push(copy);
+          currentHeaderBlock.push(copy);
+          if (chunk.equals(Buffer.from("\r\n")) || chunk.equals(Buffer.from("\n"))) {
+            const parsed = Headers.splitRawByResponse(Buffer.concat(currentHeaderBlock));
+            currentHeaderBlock = [];
+            const segment = parsed.at(-1);
+            if (!segment) return chunk.length;
+
+            const informational = segment.statusCode >= 100 && segment.statusCode < 200;
+            const proxyConnect = segment.statusCode === 200
+              && /connection established/i.test(segment.statusText);
+            const authNegotiation = segment.statusCode === 401 && mergedOptions.auth !== undefined;
+            const proxyAuthNegotiation = segment.statusCode === 407
+              && mergedOptions.proxyAuth !== undefined;
+            if (informational || proxyConnect || authNegotiation || proxyAuthNegotiation) {
+              return chunk.length;
+            }
+
+            responseSegments.push(segment);
             const followingRedirect = mergedOptions.allowRedirects !== false
-              && statusCode >= 300 && statusCode < 400;
-            if (!followingRedirect && statusCode >= 200 && !response) {
+              && segment.statusCode >= 300 && segment.statusCode < 400;
+            if (!followingRedirect && segment.statusCode >= 200 && !response) {
               resolveHeaders(makeResponse());
             }
           }
@@ -722,16 +748,19 @@ export class Session {
    * Close the session and release resources
    */
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
-    const error = new SessionClosed();
-    const active = [...this.activeTransfers.entries()];
-    for (const [cancel] of active) cancel(error);
-    await Promise.allSettled(active.map(([, settled]) => settled));
+    this.closePromise = (async () => {
+      const error = new SessionClosed();
+      const active = [...this.activeTransfers.entries()];
+      for (const [cancel] of active) void cancel(error);
+      await Promise.allSettled(active.map(([, settled]) => settled));
 
-    if (this.ownMulti) {
-      await this.multi.close();
-    }
+      if (this.ownMulti) {
+        await this.multi.close();
+      }
+    })();
+    return this.closePromise;
   }
 
   /**

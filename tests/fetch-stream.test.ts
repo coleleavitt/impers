@@ -1,4 +1,6 @@
+import { jest } from "@jest/globals";
 import { fetch, Session, SessionClosed } from "../src/index.js";
+import { Curl } from "../src/core/easy.js";
 import { createStreamGate, getRouteHits, resetRouteHits } from "./mock-server.js";
 
 const url = (path: string): string => `${globalThis.TEST_SERVER_URL}${path}`;
@@ -11,6 +13,61 @@ describe("streaming responses", () => {
     const response = await responsePromise;
     gate.release();
     expect(await response.text()).toBe("released");
+  });
+
+
+  test("selects final headers after informational blocks", async () => {
+    const response = await fetch(url("/stream-early-hints"));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-final")).toBe("yes");
+    expect(await response.text()).toBe("final body");
+  });
+
+  test("does not select an authentication challenge as the response", async () => {
+    const session = new Session();
+    try {
+      const response = await session.stream("GET", url("/stream-auth-negotiation"), {
+        auth: { type: "digest", username: "user", password: "password" },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers.get("x-final")).toBe("yes");
+      expect(await response.aText()).toBe("authenticated");
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("concurrent response closes await exactly-once native cleanup", async () => {
+    const gate = createStreamGate("close-settlement");
+    const cleanup = jest.spyOn(Curl.prototype, "cleanup");
+    const session = new Session();
+    try {
+      const request = session.stream("GET", url("/stream-gated/close-settlement"));
+      await gate.headers;
+      const response = await request;
+      await Promise.all([response.close(), response.aClose(), response.close()]);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      gate.release();
+      await session.close();
+      cleanup.mockRestore();
+    }
+  });
+
+  test("global body cancellation waits for native teardown during completion race", async () => {
+    const gate = createStreamGate("cancel-cleanup-race");
+    const cleanup = jest.spyOn(Curl.prototype, "cleanup");
+    try {
+      const request = fetch(url("/stream-gated/cancel-cleanup-race"));
+      await gate.headers;
+      const response = await request;
+      gate.release();
+      await response.body!.cancel();
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      gate.release();
+      cleanup.mockRestore();
+    }
   });
 
   test("preserves repeated Set-Cookie through global fetch Headers", async () => {

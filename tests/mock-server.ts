@@ -397,6 +397,27 @@ export async function startMockServer(port = 0): Promise<number> {
     return reply.send();
   });
 
+  server.get("/stream-early-hints", async (_request, reply) => {
+    reply.hijack();
+    reply.raw.writeEarlyHints({ link: "</intermediate.css>; rel=preload" });
+    reply.raw.writeHead(200, { "content-type": "text/plain", "x-final": "yes" });
+    reply.raw.end("final body");
+  });
+
+  server.get("/stream-auth-negotiation", async (request, reply) => {
+    const authorization = request.headers.authorization;
+    if (authorization?.startsWith("Digest ")) {
+      reply.header("x-final", "yes");
+      return reply.send("authenticated");
+    }
+    reply.code(401);
+    reply.header(
+      "www-authenticate",
+      'Digest realm="stream", nonce="fixed-nonce", qop="auth", algorithm=MD5',
+    );
+    return reply.send("challenge");
+  });
+
   server.get("/stream-truncated", async (_request, reply) => {
     reply.hijack();
     reply.raw.writeHead(200, { "content-type": "text/plain", "content-length": "100" });

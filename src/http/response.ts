@@ -60,7 +60,7 @@ export class Response {
   private _encoding: BufferEncoding = "utf-8";
   private readonly _statusText: string | null = null;
   private _close: (() => void | Promise<void>) | null = null;
-  private _closed = false;
+  private _closePromise: Promise<void> | null = null;
 
   constructor(init: ResponseInit) {
     this.requestUrl = init.requestUrl || "";
@@ -355,11 +355,11 @@ export class Response {
    * Close the response (cleanup resources)
    */
   async close(): Promise<void> {
-    if (this._closed) return;
-    this._closed = true;
+    if (this._closePromise) return this._closePromise;
     const close = this._close;
     this._close = null;
-    await close?.();
+    this._closePromise = Promise.resolve().then(() => close?.());
+    return this._closePromise;
   }
 
   /**
