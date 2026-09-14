@@ -11,7 +11,15 @@ import {
   loadedLibcurlPath,
   type LoadedLibcurlInfo,
 } from "../src/public.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -183,6 +191,37 @@ describe("libcurl loader", () => {
     expect(pickAsset(assets, "linux", "x64")).toBeNull();
   });
 
+  it("does not match win inside darwin", () => {
+    const assets = [{
+      name: "libcurl-impersonate-darwin-x86_64.zip",
+      browser_download_url: "https://example.invalid/darwin.zip",
+    }];
+    expect(pickAsset(assets, "win32", "x64")).toBeNull();
+  });
+
+  it.each([
+    ["linux", "libcurl-impersonate-linux-x86_64.so"],
+    ["linux", "libcurl-impersonate-linux-x86_64.so.4.8"],
+    ["darwin", "libcurl-impersonate-darwin-x86_64.dylib"],
+    ["win32", "libcurl-impersonate-windows-x86_64.dll"],
+  ])("accepts a strict %s direct-library asset name", (platform, name) => {
+    const asset = { name, browser_download_url: `https://example.invalid/${name}` };
+    expect(pickAsset([asset], platform, "x64")).toEqual(asset);
+  });
+
+  it.each([
+    ["linux", "libcurl-impersonate-linux-x86_64.so.sha256"],
+    ["linux", "libcurl-impersonate-linux-x86_64.so.sig"],
+    ["linux", "libcurl-impersonate-linux-x86_64.so.4.sig"],
+    ["darwin", "libcurl-impersonate-darwin-x86_64.dylib.sha256"],
+    ["darwin", "libcurl-impersonate-darwin-x86_64.dylib.sig"],
+    ["win32", "libcurl-impersonate-windows-x86_64.dll.sha256"],
+    ["win32", "libcurl-impersonate-windows-x86_64.dll.sig"],
+  ])("rejects a non-library %s direct asset named %s", (platform, name) => {
+    const asset = { name, browser_download_url: `https://example.invalid/${name}` };
+    expect(pickAsset([asset], platform, "x64")).toBeNull();
+  });
+
   it.each([
     { name: "../outside/libcurl-impersonate.so", type: "file" as const, data: Buffer.from("bad") },
     { name: "/tmp/libcurl-impersonate.so", type: "file" as const, data: Buffer.from("bad") },
@@ -193,6 +232,45 @@ describe("libcurl loader", () => {
       expect(() => writeExtractedEntries([entry], targetDir, "linux")).toThrow(/Unsafe|escapes/);
     } finally {
       rmSync(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not write through a pre-existing symlink ancestor", () => {
+    const root = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    const targetDir = join(root, "target");
+    const outsideDir = join(root, "outside");
+    mkdirSync(targetDir);
+    mkdirSync(outsideDir);
+    symlinkSync(outsideDir, join(targetDir, "lib"), "dir");
+
+    try {
+      expect(() => writeExtractedEntries([{
+        name: "lib/libcurl-impersonate.so",
+        data: Buffer.from("must stay inside"),
+        type: "file",
+      }], targetDir, "linux")).toThrow(/Unsafe extraction directory component/);
+      expect(existsSync(join(outsideDir, "libcurl-impersonate.so"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlink extraction root", () => {
+    const root = mkdtempSync(join(tmpdir(), "impers-loader-"));
+    const outsideDir = join(root, "outside");
+    const targetDir = join(root, "target");
+    mkdirSync(outsideDir);
+    symlinkSync(outsideDir, targetDir, "dir");
+
+    try {
+      expect(() => writeExtractedEntries([{
+        name: "libcurl-impersonate.so",
+        data: Buffer.from("must stay inside"),
+        type: "file",
+      }], targetDir, "linux")).toThrow(/Unsafe extraction root/);
+      expect(existsSync(join(outsideDir, "libcurl-impersonate.so"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

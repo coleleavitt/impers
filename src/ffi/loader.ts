@@ -1,7 +1,10 @@
 import {
+  closeSync,
+  constants,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   realpathSync,
   readFileSync,
@@ -518,9 +521,48 @@ function sanitizeArchivePath(name: string): string | null {
   return parts.join("/");
 }
 
-function writeFileAtomic(outPath: string, data: Buffer): void {
+function ensureSafeDirectory(targetRoot: string, directory: string): void {
+  if (!isContained(targetRoot, directory)) {
+    throw new Error(`Extraction directory escapes root: ${directory}`);
+  }
+
+  if (!existsSync(targetRoot)) {
+    mkdirSync(targetRoot);
+  }
+  const rootStat = lstatSync(targetRoot);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`Unsafe extraction root: ${targetRoot}`);
+  }
+
+  const rel = relative(targetRoot, directory);
+  let current = targetRoot;
+  for (const component of rel ? rel.split(/[\\/]/) : []) {
+    current = join(current, component);
+    if (!existsSync(current)) {
+      mkdirSync(current);
+    }
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Unsafe extraction directory component: ${current}`);
+    }
+  }
+}
+
+function writeFileAtomic(outPath: string, data: Buffer, targetRoot: string): void {
+  const parent = dirname(outPath);
+  ensureSafeDirectory(targetRoot, parent);
   const tmpPath = `${outPath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmpPath, data);
+  const fd = openSync(
+    tmpPath,
+    constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+    0o600
+  );
+  try {
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+  ensureSafeDirectory(targetRoot, parent);
   renameSync(tmpPath, outPath);
 }
 
@@ -572,13 +614,12 @@ export function writeExtractedEntries(
     }
   }
 
-  mkdirSync(targetRoot, { recursive: true });
+  ensureSafeDirectory(targetRoot, targetRoot);
   for (const { entry, outPath } of prepared) {
     if (entry.type === "symlink") {
       continue;
     }
-    mkdirSync(dirname(outPath), { recursive: true });
-    writeFileAtomic(outPath, entry.data ?? Buffer.alloc(0));
+    writeFileAtomic(outPath, entry.data ?? Buffer.alloc(0), targetRoot);
   }
 
   if (platform === "win32") {
@@ -588,7 +629,7 @@ export function writeExtractedEntries(
     if (entry.type !== "symlink") {
       continue;
     }
-    mkdirSync(dirname(outPath), { recursive: true });
+    ensureSafeDirectory(targetRoot, dirname(outPath));
     symlinkSync(entry.linkName!, outPath);
   }
 }
@@ -665,8 +706,8 @@ export function pickAsset(
     }
     const name = asset.name.toLowerCase();
     const supported = name.endsWith(".tar.gz") || name.endsWith(".tgz") ||
-      name.endsWith(".tar") || name.endsWith(".zip") || name.endsWith(".dylib") ||
-      name.endsWith(".dll") || name.includes(".so");
+      name.endsWith(".tar") || name.endsWith(".zip") ||
+      isDirectLibraryAsset(name, platform);
     return name.startsWith("libcurl") && name.includes("impersonate") && supported &&
       hasAnyToken(name, platformTokens) && hasAnyToken(name, archTokens) &&
       !hasAnyToken(name, platformExcludes);
@@ -718,7 +759,33 @@ function rankByExt(name: string, platform: string): number {
 
 function hasAnyToken(name: string, tokens: string[]): boolean {
   const lower = name.toLowerCase();
-  return tokens.some((token) => lower.includes(token));
+  return tokens.some((token) => {
+    const needle = token.toLowerCase();
+    let from = 0;
+    for (;;) {
+      const index = lower.indexOf(needle, from);
+      if (index === -1) return false;
+      const before = index === 0 || !/[a-z0-9]/.test(lower[index - 1]);
+      const end = index + needle.length;
+      const after = end === lower.length || !/[a-z0-9]/.test(lower[end]);
+      if (before && after) return true;
+      from = index + 1;
+    }
+  });
+}
+
+function isDirectLibraryAsset(name: string, platform: string): boolean {
+  const base = basename(name.toLowerCase());
+  if (platform === "linux") {
+    return /\.so(?:\.\d+)*$/.test(base);
+  }
+  if (platform === "darwin") {
+    return /\.dylib$/.test(base);
+  }
+  if (platform === "win32") {
+    return /\.dll$/.test(base);
+  }
+  return false;
 }
 
 function extractArchive(
@@ -736,10 +803,7 @@ function extractArchive(
   if (lower.endsWith(".zip")) {
     return extractFromZip(buffer);
   }
-  if (libExt === ".so" && lower.includes(".so")) {
-    return [{ name: basename(assetName), data: buffer, type: "file" }];
-  }
-  if (lower.endsWith(libExt)) {
+  if (isDirectLibraryAsset(lower, libExt === ".so" ? "linux" : libExt === ".dylib" ? "darwin" : "win32")) {
     return [{ name: basename(assetName), data: buffer, type: "file" }];
   }
   return [];
@@ -844,9 +908,15 @@ function isLibName(name: string, libPrefix: string, libExt: string): boolean {
     return false;
   }
   if (libExt === ".so") {
-    return base.includes(".so");
+    return /\.so(?:\.\d+)*$/.test(base);
   }
-  return base.endsWith(libExt);
+  if (libExt === ".dylib") {
+    return /\.dylib$/.test(base);
+  }
+  if (libExt === ".dll") {
+    return /\.dll$/.test(base);
+  }
+  return false;
 }
 
 /** Options used to make library resolution deterministic in tests and embedders. */
