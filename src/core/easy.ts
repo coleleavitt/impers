@@ -2,6 +2,7 @@ import {
   curl_easy_init,
   curl_easy_cleanup,
   curl_easy_perform,
+  curl_easy_pause,
   curl_easy_duphandle,
   curl_easy_reset,
   curl_easy_setopt_long,
@@ -334,6 +335,16 @@ export class Curl {
    */
   static hasImpersonateSupport(): boolean {
     return hasImpersonateSupport();
+  }
+
+  /**
+   * Perform the request synchronously
+   */
+  pause(mask: number): void {
+    if (!this.handle) {
+      throw new Error("Curl handle is null");
+    }
+    raiseIfError(curl_easy_pause(this.handle, mask) as number);
   }
 
   /**

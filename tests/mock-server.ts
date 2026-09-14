@@ -3,9 +3,36 @@
  * Mimics httpbin.org endpoints
  */
 import Fastify, { type FastifyInstance } from "fastify";
+import { Readable } from "node:stream";
 
 let server: FastifyInstance | null = null;
 let serverPort = 0;
+
+
+interface StreamGate {
+  headers: Promise<void>;
+  release: () => void;
+}
+
+const streamGates = new Map<string, { headersResolve: () => void; releasePromise: Promise<void>; releaseResolve: () => void }>();
+const routeHits = new Map<string, number>();
+
+export function createStreamGate(id: string): StreamGate {
+  let headersResolve!: () => void;
+  let releaseResolve!: () => void;
+  const headers = new Promise<void>((resolve) => { headersResolve = resolve; });
+  const releasePromise = new Promise<void>((resolve) => { releaseResolve = resolve; });
+  streamGates.set(id, { headersResolve, releasePromise, releaseResolve });
+  return { headers, release: releaseResolve };
+}
+
+export function resetRouteHits(path: string): void {
+  routeHits.set(path, 0);
+}
+
+export function getRouteHits(path: string): number {
+  return routeHits.get(path) ?? 0;
+}
 
 interface ParsedMultipart {
   form: Record<string, string>;
@@ -323,6 +350,60 @@ export async function startMockServer(port = 0): Promise<number> {
     return lines.join("\n");
   });
 
+  server.get<{ Params: { id: string } }>("/stream-before-headers/:id", async (request, reply) => {
+    const gate = streamGates.get(request.params.id);
+    if (!gate) return reply.code(404).send("unknown gate");
+    gate.headersResolve();
+    await gate.releasePromise;
+    streamGates.delete(request.params.id);
+    return reply.send("released");
+  });
+
+  server.get<{ Params: { id: string }; Querystring: { body?: string } }>("/stream-gated/:id", async (request, reply) => {
+    const gate = streamGates.get(request.params.id);
+    if (!gate) return reply.code(404).send("unknown gate");
+    reply.hijack();
+    reply.raw.writeHead(200, { "content-type": "text/plain" });
+    reply.raw.flushHeaders();
+    gate.headersResolve();
+    await gate.releasePromise;
+    reply.raw.end(request.query.body ?? "released");
+    streamGates.delete(request.params.id);
+  });
+
+  server.get("/manual-redirect", async (_request, reply) => reply.redirect("/counted-target"));
+  server.get("/counted-target", async () => {
+    routeHits.set("/counted-target", getRouteHits("/counted-target") + 1);
+    return "target";
+  });
+
+  server.get<{ Querystring: { chunks?: string; size?: string; delay?: string } }>("/stream-chunks", async (request, reply) => {
+    const chunks = Number(request.query.chunks ?? 3);
+    const size = Number(request.query.size ?? 8);
+    const delay = Number(request.query.delay ?? 25);
+    reply.header("content-type", "application/octet-stream");
+    reply.header("set-cookie", ["first=one; Path=/", "second=two; Path=/"]);
+    async function* generate(): AsyncGenerator<Buffer> {
+      for (let index = 0; index < chunks; index += 1) {
+        if (index > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+        yield Buffer.alloc(size, 65 + index);
+      }
+    }
+    return reply.send(Readable.from(generate()));
+  });
+
+  server.get("/stream-empty", async (_request, reply) => {
+    reply.code(204);
+    return reply.send();
+  });
+
+  server.get("/stream-truncated", async (_request, reply) => {
+    reply.hijack();
+    reply.raw.writeHead(200, { "content-type": "text/plain", "content-length": "100" });
+    reply.raw.write("partial");
+    setImmediate(() => reply.raw.socket?.destroy());
+  });
+
   // Anything endpoint - accepts any method and returns details
   server.all("/anything", async (request) => {
     return {
@@ -402,6 +483,8 @@ export async function startMockServer(port = 0): Promise<number> {
 
 export async function stopMockServer(): Promise<void> {
   if (server) {
+    for (const gate of streamGates.values()) gate.releaseResolve();
+    streamGates.clear();
     await server.close();
     server = null;
     serverPort = 0;

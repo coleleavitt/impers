@@ -158,6 +158,8 @@ export interface RequestOptions {
   // Streaming
   /** Enable streaming response */
   stream?: boolean;
+  /** Maximum queued response bytes before libcurl is paused (minimum: 16 KiB, default: 64 KiB) */
+  streamHighWaterMark?: number;
   /** Content callback for streaming */
   contentCallback?: (chunk: Buffer) => void;
   /** Header callback for raw response header chunks */

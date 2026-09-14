@@ -44,6 +44,7 @@ const curl_ws_frame = koffi.struct(`curl_ws_frame_${koffiTypeSuffix}`, {
 const curl_easy_init = lib.func("void * curl_easy_init()");
 const curl_easy_cleanup = lib.func("void curl_easy_cleanup(void *)");
 const curl_easy_perform = lib.func("int curl_easy_perform(void *)");
+const curl_easy_pause = lib.func("int curl_easy_pause(void *, int)");
 
 /**
  * Async version of curl_easy_perform that runs in a worker thread
@@ -507,6 +508,7 @@ export {
   curl_easy_init,
   curl_easy_cleanup,
   curl_easy_perform,
+  curl_easy_pause,
   curl_easy_perform_async,
   curl_easy_duphandle,
   curl_easy_reset,

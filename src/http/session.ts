@@ -4,7 +4,9 @@
 
 import { Curl } from "../core/easy.js";
 import { CurlMulti, getSharedMulti } from "../core/multi.js";
-import { CurlOpt, CurlHttpVersion, CurlAuth, CurlSslOpt } from "../ffi/constants.js";
+import {
+  CurlOpt, CurlHttpVersion, CurlAuth, CurlSslOpt, CurlPause, CURL_WRITEFUNC_PAUSE,
+} from "../ffi/constants.js";
 import { Headers } from "./headers.js";
 import { Cookies } from "./cookies.js";
 import { Response } from "./response.js";
@@ -13,6 +15,7 @@ import { CurlMime } from "../core/mime.js";
 import {
   AbortError,
   ImpersonateError,
+  InvalidHeader,
   SessionClosed,
 } from "../utils/errors.js";
 import {
@@ -42,6 +45,100 @@ import type {
   MultipartField,
 } from "../types/options.js";
 
+const CURL_MAX_WRITE_SIZE = 16 * 1024;
+const DEFAULT_STREAM_HIGH_WATER_MARK = 64 * 1024;
+const MAX_RESPONSE_HEADER_BYTES = 256 * 1024;
+const MAX_RESPONSE_HEADER_LINES = 256;
+const MAX_RESPONSE_HEADER_LINE_BYTES = 64 * 1024;
+
+class ResponseBodyStream implements AsyncIterable<Buffer> {
+  private chunks: Buffer[] = [];
+  private queuedBytes = 0;
+  private waiter: (() => void) | null = null;
+  private error: unknown = null;
+  private done = false;
+  private paused = false;
+  private closed = false;
+
+  constructor(
+    private readonly curl: Curl,
+    private readonly highWaterMark: number,
+    private readonly cancel: (error: Error) => void,
+  ) {}
+
+  write(chunk: Buffer): number | void {
+    if (this.closed) return 0;
+    if (this.queuedBytes > 0 && this.queuedBytes + chunk.length > this.highWaterMark) {
+      this.paused = true;
+      return CURL_WRITEFUNC_PAUSE;
+    }
+    const copy = Buffer.from(chunk);
+    this.chunks.push(copy);
+    this.queuedBytes += copy.length;
+    this.wake();
+  }
+
+  finish(): void {
+    if (this.done) return;
+    this.done = true;
+    this.wake();
+  }
+
+  fail(error: unknown): void {
+    if (this.done) return;
+    this.error = error;
+    this.done = true;
+    this.wake();
+  }
+
+  async close(): Promise<void> {
+    if (this.closed || this.done) return;
+    this.closed = true;
+    const error = new AbortError("Response body cancelled");
+    this.cancel(error);
+    this.fail(error);
+  }
+
+  private wake(): void {
+    const waiter = this.waiter;
+    this.waiter = null;
+    waiter?.();
+  }
+
+  private resumeIfNeeded(): void {
+    if (!this.paused || this.closed || this.done || this.queuedBytes > this.highWaterMark / 2) return;
+    this.paused = false;
+    queueMicrotask(() => {
+      if (!this.closed && !this.done) {
+        try {
+          this.curl.pause(CurlPause.CURLPAUSE_CONT);
+        } catch (error) {
+          this.cancel(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
+    });
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<Buffer> {
+    try {
+      while (true) {
+        if (this.chunks.length > 0) {
+          const chunk = this.chunks.shift()!;
+          this.queuedBytes -= chunk.length;
+          this.resumeIfNeeded();
+          yield chunk;
+          continue;
+        }
+        if (this.error) throw this.error;
+        if (this.done) return;
+        await new Promise<void>((resolve) => { this.waiter = resolve; });
+      }
+    } finally {
+      if (!this.done) await this.close();
+    }
+  }
+}
+
 /**
  * Session - HTTP client with connection pooling and cookie persistence
  *
@@ -52,6 +149,7 @@ export class Session {
   private multi: CurlMulti;
   private ownMulti: boolean;
   private closed: boolean = false;
+  private activeTransfers = new Map<(error: Error) => void, Promise<void>>();
 
   // Session defaults
   private _cookies: Cookies;
@@ -109,6 +207,9 @@ export class Session {
   async request(method: string, url: string, options: RequestOptions = {}): Promise<Response> {
     if (this.closed) {
       throw new SessionClosed();
+    }
+    if (options.stream) {
+      return this.streamingRequest(method, url, options);
     }
 
     // Resolve URL with base URL and params
@@ -353,6 +454,221 @@ export class Session {
     }
   }
 
+  private async streamingRequest(
+    method: string,
+    url: string,
+    options: RequestOptions,
+  ): Promise<Response> {
+    const resolvedUrl = this.resolveUrl(url, options.params);
+    const mergedOptions = this.mergeOptions(options);
+    const signal = mergedOptions.signal;
+    if (signal?.aborted) throw new AbortError(signal.reason);
+
+    const highWaterMark = mergedOptions.streamHighWaterMark ?? DEFAULT_STREAM_HIGH_WATER_MARK;
+    if (!Number.isSafeInteger(highWaterMark) || highWaterMark < CURL_MAX_WRITE_SIZE) {
+      throw new RangeError("streamHighWaterMark must be a safe integer of at least 16384 bytes");
+    }
+
+    const curl = new Curl();
+    const slists: SList[] = [];
+    const mimes: CurlMime[] = [];
+    const headerChunks: Buffer[] = [];
+    let abortHandler: (() => void) | undefined;
+    let cleaned = false;
+    let callbackError: Error | null = null;
+    let response: Response | null = null;
+    let resolveHeaders!: (value: Response) => void;
+    let rejectHeaders!: (error: unknown) => void;
+    const headerPromise = new Promise<Response>((resolve, reject) => {
+      resolveHeaders = resolve;
+      rejectHeaders = reject;
+    });
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+
+    const removeAbortHandler = (): void => {
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+      abortHandler = undefined;
+    };
+    const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      removeAbortHandler();
+      this.activeTransfers.delete(cancel);
+      for (const slist of slists) slist.free();
+      for (const mime of mimes) mime.free();
+      curl.cleanup();
+      resolveSettled();
+    };
+    const cancel = (error: Error): void => {
+      if (cleaned) return;
+      this.multi.cancel(curl, error);
+      body.fail(error);
+    };
+    const body = new ResponseBodyStream(curl, highWaterMark, cancel);
+
+    const makeResponse = (): Response => {
+      if (response) return response;
+      const rawHeaders = Buffer.concat(headerChunks);
+      const segments = Headers.splitRawByResponse(rawHeaders);
+      if (segments.length === 0 || segments.at(-1)!.statusCode < 100) {
+        throw new Error("Invalid HTTP response headers");
+      }
+      const history: Response[] = [];
+      let currentUrl = resolvedUrl;
+      for (let index = 0; index < segments.length - 1; index += 1) {
+        const segment = segments[index];
+        const item = new Response({
+          headers: segment.headers,
+          requestUrl: currentUrl,
+          statusCode: segment.statusCode,
+          statusText: segment.statusText,
+          url: currentUrl,
+        });
+        for (const cookie of item.cookies) this._cookies.set(cookie.name, cookie.value, cookie);
+        history.push(item);
+        const location = segment.headers.get("location");
+        if (location) {
+          try { currentUrl = new URL(location, currentUrl).href; } catch { currentUrl = location; }
+        }
+      }
+      const last = segments.at(-1);
+      response = new Response({
+        headers: last?.headers,
+        curl,
+        requestUrl: resolvedUrl,
+        elapsed: 0,
+        history,
+        statusCode: last?.statusCode,
+        statusText: last?.statusText,
+        url: history.length > 0 ? currentUrl : undefined,
+        stream: body,
+        close: () => body.close(),
+      });
+      for (const cookie of response.cookies) this._cookies.set(cookie.name, cookie.value, cookie);
+      return response;
+    };
+
+    try {
+      curl.setOpt(CurlOpt.URL, resolvedUrl);
+      this.setMethod(curl, method.toUpperCase());
+      const fingerprint = this.resolveFingerprint(mergedOptions.impersonate);
+      const headerList = this.buildHeaders(mergedOptions, fingerprint);
+      if (headerList.length > 0) {
+        const slist = new SList();
+        headerList.forEach((header) => slist.append(header));
+        slists.push(slist);
+        curl.setOpt(CurlOpt.HTTPHEADER, slist.pointer);
+      }
+      const cookieHeader = this.buildCookieHeader(resolvedUrl, mergedOptions);
+      if (cookieHeader) curl.setOpt(CurlOpt.COOKIE, cookieHeader);
+      const mime = this.setBody(curl, method, mergedOptions);
+      if (mime) mimes.push(mime);
+      this.setAuth(curl, mergedOptions);
+      this.setProxy(curl, mergedOptions);
+      this.setSslOptions(curl, mergedOptions);
+      this.setTimeouts(curl, mergedOptions);
+      this.setRedirects(curl, mergedOptions);
+      this.setHttpVersion(curl, mergedOptions);
+      this.setInterface(curl, mergedOptions);
+      this.setDnsOptions(curl, mergedOptions);
+      if (mergedOptions.decodeContent !== false) {
+        curl.setOpt(CurlOpt.ACCEPT_ENCODING, mergedOptions.acceptEncoding ?? "");
+      } else {
+        curl.setOpt(CurlOpt.HTTP_CONTENT_DECODING, 0);
+      }
+      this.setImpersonation(curl, mergedOptions, fingerprint);
+      if (mergedOptions.curlOptions) {
+        for (const [option, value] of Object.entries(mergedOptions.curlOptions)) {
+          curl.setOpt(Number(option), value);
+        }
+      }
+
+      let headerBytes = 0;
+      let headerLines = 0;
+      curl.setHeaderFunction((chunk) => {
+        if (signal?.aborted || callbackError) return 0;
+        try {
+          headerBytes += chunk.length;
+          headerLines += 1;
+          if (headerBytes > MAX_RESPONSE_HEADER_BYTES
+            || headerLines > MAX_RESPONSE_HEADER_LINES
+            || chunk.length > MAX_RESPONSE_HEADER_LINE_BYTES) {
+            callbackError = new Error("HTTP response headers exceed streaming limits");
+            return 0;
+          }
+          mergedOptions.headerCallback?.(chunk);
+          if (signal?.aborted) return 0;
+          headerChunks.push(Buffer.from(chunk));
+          if ((chunk.equals(Buffer.from("\r\n")) || chunk.equals(Buffer.from("\n")))) {
+            const statusCode = curl.getResponseCode();
+            const followingRedirect = mergedOptions.allowRedirects !== false
+              && statusCode >= 300 && statusCode < 400;
+            if (!followingRedirect && statusCode >= 200 && !response) {
+              resolveHeaders(makeResponse());
+            }
+          }
+        } catch (error) {
+          callbackError = error instanceof Error ? error : new Error(String(error));
+          return 0;
+        }
+      });
+      curl.setWriteFunction((chunk) => {
+        if (signal?.aborted || callbackError) return 0;
+        try {
+          const statusCode = curl.getResponseCode();
+          if (mergedOptions.allowRedirects !== false && statusCode >= 300 && statusCode < 400) {
+            return chunk.length;
+          }
+          const result = body.write(chunk);
+          if (result === CURL_WRITEFUNC_PAUSE) return result;
+          mergedOptions.contentCallback?.(chunk);
+          if (signal?.aborted) return 0;
+          if (!response) resolveHeaders(makeResponse());
+          return result;
+        } catch (error) {
+          callbackError = error instanceof Error ? error : new Error(String(error));
+          return 0;
+        }
+      });
+
+      abortHandler = () => cancel(new AbortError(signal?.reason));
+      signal?.addEventListener("abort", abortHandler, { once: true });
+      this.activeTransfers.set(cancel, settled);
+      if (signal?.aborted) throw new AbortError(signal.reason);
+
+      void this.multi.perform(curl).then(
+        () => {
+          if (!response) resolveHeaders(makeResponse());
+          body.finish();
+          cleanup();
+        },
+        (error: unknown) => {
+          const reason = signal?.aborted
+            ? new AbortError(signal.reason)
+            : callbackError ?? (error instanceof Error ? error : new Error(String(error)));
+          if (response) body.fail(reason);
+          else rejectHeaders(reason);
+          cleanup();
+        },
+      );
+      return await headerPromise;
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+  }
+
+  /**
+   * Start a header-first streaming HTTP request.
+   *
+   * The promise resolves when the first response body bytes arrive, or when
+   * libcurl reports completion for a response with no body.
+   */
+  async stream(method: string, url: string, options: RequestOptions = {}): Promise<Response> {
+    return this.request(method, url, { ...options, stream: true });
+  }
+
   /**
    * HTTP GET request
    */
@@ -408,6 +724,10 @@ export class Session {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    const error = new SessionClosed();
+    const active = [...this.activeTransfers.entries()];
+    for (const [cancel] of active) cancel(error);
+    await Promise.allSettled(active.map(([, settled]) => settled));
 
     if (this.ownMulti) {
       await this.multi.close();
@@ -596,7 +916,13 @@ export class Session {
       headers.set("Content-Type", "application/x-www-form-urlencoded");
     }
 
-    return headers.toCurlHeaders();
+    const result = headers.toCurlHeaders();
+    for (const header of result) {
+      if (header.includes("\r") || header.includes("\n") || header.includes("\0")) {
+        throw new InvalidHeader(header);
+      }
+    }
+    return result;
   }
 
   /**

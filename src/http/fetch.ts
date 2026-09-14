@@ -103,6 +103,8 @@ export interface ImpersRequestInit extends RequestInit {
   acceptEncoding?: string;
   /** Decode response content automatically (default: true) */
   decodeContent?: boolean;
+  /** Maximum queued response bytes before libcurl applies backpressure */
+  streamHighWaterMark?: number;
   /** Referer header */
   referer?: string;
   /** Request cookies */
@@ -355,6 +357,7 @@ function convertInit(init: ImpersRequestInit): {
   if (init.userAgent !== undefined) options.userAgent = init.userAgent;
   if (init.acceptEncoding !== undefined) options.acceptEncoding = init.acceptEncoding;
   if (init.decodeContent !== undefined) options.decodeContent = init.decodeContent;
+  if (init.streamHighWaterMark !== undefined) options.streamHighWaterMark = init.streamHighWaterMark;
   if (init.referer !== undefined) options.referer = init.referer;
   if (init.cookies !== undefined) options.cookies = init.cookies;
   if (init.curlOptions !== undefined) options.curlOptions = init.curlOptions;
@@ -397,25 +400,24 @@ export async function fetch(
     await convertBody(effectiveInit.body, options);
   }
 
-  // Use a fresh Session per request so cookies/headers don't leak across
-  // stateless fetch() calls. The underlying CurlMulti connection pool is still
-  // shared (Session falls back to getSharedMulti()).
-  const session = new Session();
+  // A fetch response can outlive this function while its body is consumed, so
+  // give it an owned multi handle that can be closed exactly when the stream
+  // completes or is canceled.
+  const session = new Session({ maxConnections: 1, maxHostConnections: 1 });
   let impersResponse;
   try {
-    impersResponse = await session.request(method.toUpperCase(), url, options);
+    impersResponse = await session.stream(method.toUpperCase(), url, options);
   } catch (error) {
-    // Re-wrap network errors as TypeError (Fetch semantics), preserving cause.
+    await session.close();
     if (error instanceof RequestException) {
       throw new TypeError(error.message, { cause: error });
     }
     throw error;
-  } finally {
-    await session.close();
   }
 
-  // redirect: "error" -> reject on 3xx
   if (redirect === "error" && impersResponse.statusCode >= 300 && impersResponse.statusCode < 400) {
+    await impersResponse.close();
+    await session.close();
     throw new TypeError(`redirect response (${impersResponse.statusCode}) not allowed`, {
       cause: impersResponse,
     });
@@ -425,8 +427,55 @@ export async function fetch(
     || impersResponse.statusCode === 204
     || impersResponse.statusCode === 205
     || impersResponse.statusCode === 304;
+  if (nullBody) {
+    await impersResponse.close();
+    await session.close();
+  }
 
-  return new Response(nullBody ? null : new Uint8Array(impersResponse.content), {
+  let iterator: AsyncIterator<Buffer> | null = null;
+  const signal = effectiveInit.signal;
+  let abortListener: (() => void) | null = null;
+  const finish = async (): Promise<void> => {
+    if (signal && abortListener) signal.removeEventListener("abort", abortListener);
+    abortListener = null;
+    await session.close();
+  };
+  const body = nullBody ? null : new ReadableStream<Uint8Array>({
+    start(controller) {
+      iterator = impersResponse.iterContent()[Symbol.asyncIterator]();
+      abortListener = () => {
+        void iterator?.return?.();
+        void impersResponse.close();
+        controller.error(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
+        void finish();
+      };
+      signal?.addEventListener("abort", abortListener, { once: true });
+    },
+    async pull(controller) {
+      try {
+        const result = await iterator!.next();
+        if (result.done) {
+          controller.close();
+          await finish();
+        } else {
+          controller.enqueue(new Uint8Array(result.value));
+        }
+      } catch (error) {
+        controller.error(error);
+        await finish();
+      }
+    },
+    async cancel() {
+      try {
+        await impersResponse.close();
+        void iterator?.return?.();
+      } finally {
+        await finish();
+      }
+    },
+  });
+
+  return new Response(body, {
     status: impersResponse.statusCode,
     statusText: impersResponse.reason,
     headers: convertImpersHeadersToGlobal(impersResponse.headers),

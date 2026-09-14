@@ -118,6 +118,33 @@ console.log(r.json());
 await session.close();
 ```
 
+### Streaming responses
+
+`Session.stream()` resolves when the final response headers and first body chunk arrive. For an empty response it resolves when the transfer completes. Consume `iterContent()` or use the async body helpers. Closing the response cancels an unfinished transfer.
+
+```typescript
+const session = new Session();
+try {
+  const response = await session.stream("GET", "https://example.com/events", {
+    streamHighWaterMark: 64 * 1024,
+  });
+  for await (const chunk of response.iterContent()) {
+    process.stdout.write(chunk);
+  }
+} finally {
+  await session.close();
+}
+```
+
+The Fetch-compatible API also returns a live `ReadableStream`; it no longer buffers the complete response before resolving:
+
+```typescript
+const response = await impers.fetch("https://example.com/large-file");
+const reader = response.body!.getReader();
+```
+
+Backpressure is byte-bounded. When the queued body exceeds `streamHighWaterMark`, impers pauses libcurl until the consumer drains the queue. Cancel the reader, abort its signal, or close the session to stop the native transfer.
+
 ### Supported Impersonate Browsers
 
 `impers` supports the same browser versions as [curl-impersonate](https://github.com/lexiforest/curl-impersonate):
@@ -318,6 +345,7 @@ await session.close();
 | `akamai` | `string` | Akamai HTTP/2 fingerprint string |
 | `extraFp` | `ExtraFingerprint` | Fine-grained fingerprint options |
 | `stream` | `boolean` | Do not buffer response content |
+| `streamHighWaterMark` | `number` | Maximum queued streaming bytes before pausing libcurl (minimum: 16 KiB, default: 64 KiB) |
 | `contentCallback` | `(chunk: Buffer) => void` | Callback for response body chunks |
 | `headerCallback` | `(chunk: Buffer) => void` | Callback for raw response header chunks |
 | `httpVersion` | `string` | Force HTTP version ("1.0", "1.1", "2", "3") |
