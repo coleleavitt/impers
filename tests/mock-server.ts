@@ -371,6 +371,18 @@ export async function startMockServer(port = 0): Promise<number> {
     streamGates.delete(request.params.id);
   });
 
+  server.get<{ Params: { id: string } }>("/stream-gated-invalid-status/:id", async (request, reply) => {
+    const gate = streamGates.get(request.params.id);
+    if (!gate) return reply.code(404).send("unknown gate");
+    reply.hijack();
+    reply.raw.writeHead(600, { "content-type": "text/plain" });
+    reply.raw.flushHeaders();
+    gate.headersResolve();
+    await gate.releasePromise;
+    reply.raw.end("invalid status");
+    streamGates.delete(request.params.id);
+  });
+
   server.get("/manual-redirect", async (_request, reply) => reply.redirect("/counted-target"));
   server.get("/counted-target", async () => {
     routeHits.set("/counted-target", getRouteHits("/counted-target") + 1);

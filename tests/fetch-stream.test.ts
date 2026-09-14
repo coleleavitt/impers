@@ -85,10 +85,56 @@ describe("streaming responses", () => {
     expect(response.body).toBeNull();
   });
 
-  test("surfaces post-header failure and permits a subsequent request", async () => {
+  test("normalizes post-header transfer failures without exposing their cause", async () => {
     const response = await fetch(url("/stream-truncated"));
-    await expect(response.text()).rejects.toThrow();
+    let rejection: unknown;
+    try {
+      await response.text();
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(TypeError);
+    expect((rejection as TypeError).message).toBe("Network error while reading response body");
+    expect((rejection as TypeError).cause).toBeUndefined();
     expect((await fetch(url("/get"))).status).toBe(200);
+  });
+
+  test("closes native resources when global Response rejects the status", async () => {
+    const gate = createStreamGate("invalid-global-status");
+    const cleanup = jest.spyOn(Curl.prototype, "cleanup");
+    try {
+      const request = fetch(url("/stream-gated-invalid-status/invalid-global-status"));
+      await gate.headers;
+      await expect(request).rejects.toMatchObject({ name: "RangeError" });
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      gate.release();
+      cleanup.mockRestore();
+    }
+  });
+
+  test("preserves AbortError for post-header body aborts", async () => {
+    const gate = createStreamGate("abort-body-error-class");
+    const controller = new AbortController();
+    try {
+      const request = fetch(url("/stream-gated/abort-body-error-class"), {
+        signal: controller.signal,
+      });
+      await gate.headers;
+      const response = await request;
+      controller.abort();
+      let rejection: unknown;
+      try {
+        await response.text();
+      } catch (error) {
+        rejection = error;
+      }
+      expect(rejection).toBeInstanceOf(DOMException);
+      expect((rejection as Error).name).toBe("AbortError");
+      expect(rejection).not.toBeInstanceOf(TypeError);
+    } finally {
+      gate.release();
+    }
   });
 
   test("cancel stops transfer and permits a subsequent request", async () => {

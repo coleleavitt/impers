@@ -191,6 +191,17 @@ function convertImpersHeadersToGlobal(headers: ImpersHeaders): Headers {
   return new Headers(Array.from(headers.entries()));
 }
 
+/** Convert response-body failures to Fetch-compatible errors without exposing internals. */
+function toFetchBodyError(error: unknown, signal: AbortSignal | null | undefined): unknown {
+  if (signal?.aborted) {
+    return signal.reason;
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return error;
+  }
+  return new TypeError("Network error while reading response body");
+}
+
 /** Set a body-derived Content-Type unless the caller already supplied one. */
 function setDefaultContentType(options: RequestOptions, contentType: string): void {
   const headers = new ImpersHeaders(options.headers);
@@ -461,7 +472,7 @@ export async function fetch(
           controller.enqueue(new Uint8Array(result.value));
         }
       } catch (error) {
-        controller.error(error);
+        controller.error(toFetchBodyError(error, signal));
         await finish();
       }
     },
@@ -475,9 +486,14 @@ export async function fetch(
     },
   });
 
-  return new Response(body, {
-    status: impersResponse.statusCode,
-    statusText: impersResponse.reason,
-    headers: convertImpersHeadersToGlobal(impersResponse.headers),
-  });
+  try {
+    return new Response(body, {
+      status: impersResponse.statusCode,
+      statusText: impersResponse.reason,
+      headers: convertImpersHeadersToGlobal(impersResponse.headers),
+    });
+  } catch (error) {
+    await Promise.allSettled([impersResponse.close(), finish()]);
+    throw error;
+  }
 }
