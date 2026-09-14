@@ -9,7 +9,8 @@ declare module "koffi" {
     load(path: string): KoffiLibrary;
 
     // Type definitions
-    struct(name: string, members: Record<string, string>): KoffiType;
+    struct(name: string, members: Record<string, string | KoffiType>): KoffiType;
+    union(name: string, members: Record<string, string | KoffiType>): KoffiType;
     pointer(type: string | KoffiType): KoffiType;
     out(type: string | KoffiType): KoffiType;
     inout(type: string | KoffiType): KoffiType;

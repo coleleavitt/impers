@@ -34,6 +34,14 @@ const CURLMSG_DONE = 1;
 /** Avoid letting an unbounded run of control frames monopolize one receive poll. */
 const MAX_CONTROL_FRAMES_PER_POLL = 100;
 
+/** Give a peer a short, bounded opportunity to complete a locally initiated close. */
+const CLOSE_SETTLE_MS = 250;
+
+const CLOSE_NO_STATUS = 1005;
+const CLOSE_ABNORMAL = 1006;
+const CLOSE_PROTOCOL_ERROR = 1002;
+const CLOSE_INVALID_PAYLOAD = 1007;
+
 /**
  * WebSocket message types
  */
@@ -79,7 +87,8 @@ export class AsyncWebSocket {
 
   private receiveBuffer: Buffer;
   private messageQueue: WebSocketMessage[] = [];
-  private fragmentedMessage: { data: Buffer; flags: number; received: number } | null = null;
+  private fragmentedFrame: { data: Buffer; flags: number; received: number } | null = null;
+  private fragmentedMessage: { chunks: Buffer[]; flags: number; size: number } | null = null;
 
   private multi: CurlMultiHandle | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -95,8 +104,12 @@ export class AsyncWebSocket {
    */
   private constructor(url: string, options: WebSocketOptions = {}) {
     this._url = url;
-    this.maxMessageSize = options.maxMessageSize || 64 * 1024 * 1024; // 64MB default
-    this.receiveBuffer = Buffer.alloc(Math.min(this.maxMessageSize, 1024 * 1024)); // Start with 1MB
+    const maxMessageSize = options.maxMessageSize ?? 64 * 1024 * 1024;
+    if (!Number.isSafeInteger(maxMessageSize) || maxMessageSize <= 0) {
+      throw new WebSocketError("maxMessageSize must be a positive safe integer");
+    }
+    this.maxMessageSize = maxMessageSize;
+    this.receiveBuffer = Buffer.alloc(Math.min(this.maxMessageSize, 1024 * 1024));
 
     this.curl = new Curl();
     this.handle = this.curl.getHandle()!;
@@ -297,75 +310,97 @@ export class AsyncWebSocket {
     for (let controlFrames = 0; controlFrames < MAX_CONTROL_FRAMES_PER_POLL; controlFrames++) {
       const { code, received, frame } = curl_ws_recv(this.handle, this.receiveBuffer);
       if (code === CurlCode.CURLE_AGAIN) return null;
-      if (code !== CurlCode.CURLE_OK) throw new WebSocketError(`Receive error: ${code}`);
+      if (code !== CurlCode.CURLE_OK) {
+        const error = new WebSocketError(`Receive error: ${code}`, code);
+        this.failConnection();
+        throw error;
+      }
       if (received === 0 && frame === null) return null;
 
       const flags = frame?.flags ?? CurlWsFlag.CURLWS_TEXT;
       const offset = Number(frame?.offset ?? 0n);
       const bytesLeft = Number(frame?.bytesleft ?? 0n);
-      const totalLength = offset + received + bytesLeft;
-      if (!Number.isSafeInteger(totalLength) || totalLength > this.maxMessageSize) {
-        throw new WebSocketError(`WebSocket frame exceeds maximum size of ${this.maxMessageSize} bytes`);
+      const frameLength = offset + received + bytesLeft;
+      if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(bytesLeft) ||
+          !Number.isSafeInteger(frameLength) || offset < 0 || bytesLeft < 0) {
+        this.failConnection();
+        throw new WebSocketError("Received invalid WebSocket frame metadata");
+      }
+
+      const isControl = (flags & (CurlWsFlag.CURLWS_CLOSE | CurlWsFlag.CURLWS_PING | CurlWsFlag.CURLWS_PONG)) !== 0;
+      const accumulated = isControl ? 0 : (this.fragmentedMessage?.size ?? 0);
+      if (!isControl &&
+          (frameLength > this.maxMessageSize || accumulated + frameLength > this.maxMessageSize)) {
+        this.failConnection();
+        throw new WebSocketError(`WebSocket message exceeds maximum size of ${this.maxMessageSize} bytes`);
       }
 
       let data: Buffer;
-      let messageFlags = flags;
+      let frameFlags = flags;
       if (offset === 0 && bytesLeft === 0) {
         data = Buffer.from(this.receiveBuffer.subarray(0, received));
       } else {
         if (offset === 0) {
-          this.fragmentedMessage = {
-            data: Buffer.alloc(totalLength),
-            flags,
-            received: 0,
-          };
+          this.fragmentedFrame = { data: Buffer.alloc(frameLength), flags, received: 0 };
         }
-        const fragmented = this.fragmentedMessage;
-        if (!fragmented || offset !== fragmented.received || totalLength !== fragmented.data.length) {
-          this.fragmentedMessage = null;
+        const fragmented = this.fragmentedFrame;
+        if (!fragmented || offset !== fragmented.received || frameLength !== fragmented.data.length) {
+          this.fragmentedFrame = null;
+          this.failConnection();
           throw new WebSocketError("Received inconsistent fragmented WebSocket frame metadata");
         }
         this.receiveBuffer.copy(fragmented.data, offset, 0, received);
         fragmented.received += received;
         if (bytesLeft > 0) return null;
         data = fragmented.data;
-        messageFlags = fragmented.flags;
-        this.fragmentedMessage = null;
+        frameFlags = fragmented.flags;
+        this.fragmentedFrame = null;
       }
 
-      const message = this.frameToMessage(data, messageFlags);
-      if (!message) continue;
-
-      if (message.type === WebSocketMessageType.CLOSE) {
-        this.handleCloseFrame(message.data);
-        try {
-          this.cleanupResources();
-        } catch (error) {
-          throw error instanceof Error ? error : new WebSocketError(String(error));
+      if (isControl) {
+        if ((frameFlags & CurlWsFlag.CURLWS_CONT) !== 0 || data.length > 125) {
+          this.abortWithClose(CLOSE_PROTOCOL_ERROR, "Invalid control frame");
+          throw new WebSocketClosed(CLOSE_ABNORMAL, "Invalid control frame");
         }
-        throw new WebSocketClosed(
-          this._closeEvent?.code || 1000,
-          this._closeEvent?.reason || ""
-        );
-      }
-
-      if (message.type === WebSocketMessageType.PING) {
-        try {
-          this.sendPongNow(message.data);
-        } catch (error) {
-          this._closed = true;
-          this._connected = false;
+        const message = this.frameToMessage(data, frameFlags);
+        if (message?.type === WebSocketMessageType.CLOSE) {
+          this.handleCloseFrame(message.data);
+          throw new WebSocketClosed(this._closeEvent?.code ?? CLOSE_ABNORMAL, this._closeEvent?.reason ?? "");
+        }
+        if (message?.type === WebSocketMessageType.PING) {
           try {
-            this.cleanupResources();
-          } catch {
-            // Keep the auto-pong error as the cause visible to the caller.
+            this.sendPongNow(message.data);
+          } catch (error) {
+            this.failConnection();
+            throw error;
           }
-          throw error;
         }
+        if (message?.type === WebSocketMessageType.PONG) return message;
         continue;
       }
 
-      return message;
+      const continues = (frameFlags & CurlWsFlag.CURLWS_CONT) !== 0;
+      const messageTypeFlags = frameFlags & (CurlWsFlag.CURLWS_TEXT | CurlWsFlag.CURLWS_BINARY);
+      if (this.fragmentedMessage) {
+        if (messageTypeFlags !== this.fragmentedMessage.flags) {
+          this.failConnection();
+          throw new WebSocketError("Fragmented WebSocket message changed type");
+        }
+        this.fragmentedMessage.chunks.push(data);
+        this.fragmentedMessage.size += data.length;
+        if (continues) return null;
+        const message = this.frameToMessage(
+          Buffer.concat(this.fragmentedMessage.chunks, this.fragmentedMessage.size),
+          this.fragmentedMessage.flags
+        );
+        this.fragmentedMessage = null;
+        return message;
+      }
+      if (continues) {
+        this.fragmentedMessage = { chunks: [data], flags: messageTypeFlags, size: data.length };
+        return null;
+      }
+      return this.frameToMessage(data, frameFlags);
     }
 
     return null;
@@ -394,19 +429,80 @@ export class AsyncWebSocket {
    * Handle close frame
    */
   private handleCloseFrame(data: Buffer): void {
-    let code = 1000;
-    let reason = "";
-
-    if (data.length >= 2) {
-      code = data.readUInt16BE(0);
-      if (data.length > 2) {
-        reason = data.subarray(2).toString("utf-8");
-      }
+    const parsed = this.parseClosePayload(data);
+    if (!parsed.valid) {
+      this.abortWithClose(parsed.errorCode, parsed.reason);
+      return;
     }
 
-    this._closeEvent = { code, reason, wasClean: true };
+    let echoed = true;
+    if (!this._closeEvent) {
+      try {
+        this.sendClosePayload(data);
+      } catch {
+        echoed = false;
+      }
+    }
+    this._closeEvent = { code: parsed.code, reason: parsed.reason, wasClean: echoed };
     this._closed = true;
     this._connected = false;
+    this.stopPolling();
+    this.cleanupResources();
+  }
+
+  private parseClosePayload(data: Buffer):
+    | { valid: true; code: number; reason: string }
+    | { valid: false; errorCode: number; reason: string } {
+    if (data.length === 0) return { valid: true, code: CLOSE_NO_STATUS, reason: "" };
+    if (data.length === 1 || data.length > 125) {
+      return { valid: false, errorCode: CLOSE_PROTOCOL_ERROR, reason: "Invalid close payload" };
+    }
+    const code = data.readUInt16BE(0);
+    if (!this.isValidCloseCode(code)) {
+      return { valid: false, errorCode: CLOSE_PROTOCOL_ERROR, reason: "Invalid close code" };
+    }
+    try {
+      const reason = new TextDecoder("utf-8", { fatal: true }).decode(data.subarray(2));
+      return { valid: true, code, reason };
+    } catch {
+      return { valid: false, errorCode: CLOSE_INVALID_PAYLOAD, reason: "Invalid close reason" };
+    }
+  }
+
+  private isValidCloseCode(code: number): boolean {
+    return (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+      (code >= 3000 && code <= 4999);
+  }
+
+  private sendClosePayload(payload: Buffer): void {
+    const { code, sent } = curl_ws_send(this.handle, payload, CurlWsFlag.CURLWS_CLOSE);
+    if (code !== CurlCode.CURLE_OK || sent !== payload.length) {
+      throw new WebSocketError(code !== CurlCode.CURLE_OK
+        ? `Close send failed with code ${code}`
+        : `Incomplete close send: ${sent}/${payload.length} bytes`, code);
+    }
+  }
+
+  private abortWithClose(code: number, reason: string): void {
+    const reasonBytes = Buffer.from(reason, "utf-8").subarray(0, 123);
+    const payload = Buffer.alloc(2 + reasonBytes.length);
+    payload.writeUInt16BE(code, 0);
+    reasonBytes.copy(payload, 2);
+    try { this.sendClosePayload(payload); } catch { /* best effort protocol error */ }
+    this._closeEvent = { code: CLOSE_ABNORMAL, reason, wasClean: false };
+    this.failConnection();
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+  }
+
+  private failConnection(): void {
+    this._closed = true;
+    this._connected = false;
+    this.stopPolling();
+    try { this.cleanupResources(); } catch { /* preserve the transport/protocol error */ }
   }
 
   /**
@@ -415,7 +511,7 @@ export class AsyncWebSocket {
   async recv(timeout?: number): Promise<WebSocketMessage> {
     if (this._closed) {
       throw new WebSocketClosed(
-        this._closeEvent?.code || 1006,
+        this._closeEvent?.code ?? CLOSE_ABNORMAL,
         this._closeEvent?.reason || "Connection closed"
       );
     }
@@ -449,7 +545,7 @@ export class AsyncWebSocket {
           this.pollTimer = null;
           reject(
             new WebSocketClosed(
-              this._closeEvent?.code || 1006,
+              this._closeEvent?.code ?? CLOSE_ABNORMAL,
               this._closeEvent?.reason || "Connection closed"
             )
           );
@@ -503,19 +599,18 @@ export class AsyncWebSocket {
   private async sendRaw(data: Buffer, flags: number): Promise<void> {
     if (this._closed) {
       throw new WebSocketClosed(
-        this._closeEvent?.code || 1006,
+        this._closeEvent?.code ?? CLOSE_ABNORMAL,
         this._closeEvent?.reason || "Connection closed"
       );
     }
 
     const { code, sent } = curl_ws_send(this.handle, data, flags);
-
-    if (code !== CurlCode.CURLE_OK) {
-      throw new WebSocketError(`Send failed with code ${code}`);
-    }
-
-    if (sent !== data.length) {
-      throw new WebSocketError(`Incomplete send: ${sent}/${data.length} bytes`);
+    if (code !== CurlCode.CURLE_OK || sent !== data.length) {
+      const error = new WebSocketError(code !== CurlCode.CURLE_OK
+        ? `Send failed with code ${code}`
+        : `Incomplete send: ${sent}/${data.length} bytes`, code);
+      this.failConnection();
+      throw error;
     }
   }
 
@@ -599,31 +694,42 @@ export class AsyncWebSocket {
    */
   async close(code: number = 1000, reason: string = ""): Promise<void> {
     if (this._closed) return;
+    if (!this.isValidCloseCode(code)) throw new WebSocketError(`Invalid close code: ${code}`);
+    this.stopPolling();
 
-    // Build close frame payload
     const reasonBytes = Buffer.from(reason, "utf-8");
+    if (reasonBytes.length > 123) throw new WebSocketError("Close reason exceeds 123 UTF-8 bytes");
     const payload = Buffer.alloc(2 + reasonBytes.length);
     payload.writeUInt16BE(code, 0);
     reasonBytes.copy(payload, 2);
 
     try {
-      await this.sendRaw(payload, CurlWsFlag.CURLWS_CLOSE);
-    } catch {
-      // Ignore send errors during close
+      this.sendClosePayload(payload);
+    } catch (error) {
+      this.failConnection();
+      throw error;
     }
 
-    this._closeEvent = { code, reason, wasClean: true };
-    this._closed = true;
-    this._connected = false;
-
-    // Stop any pending polls
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
+    // Record the local proposal but do not report a clean close until a valid peer CLOSE
+    // arrives. Continue receiving for a bounded period so the handshake can complete.
+    this._closeEvent = { code, reason, wasClean: false };
+    const deadline = Date.now() + CLOSE_SETTLE_MS;
+    while (!this._closed && Date.now() < deadline) {
+      try {
+        this.tryReceive();
+      } catch (error) {
+        if (error instanceof WebSocketClosed) break;
+        throw error;
+      }
+      if (!this._closed) await new Promise((resolve) => setTimeout(resolve, this.pollInterval));
     }
 
-    // Cleanup
-    this.cleanupResources();
+    if (!this._closed) {
+      this._closed = true;
+      this._connected = false;
+      this.stopPolling();
+      this.cleanupResources();
+    }
   }
 
   /**

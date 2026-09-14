@@ -19,14 +19,16 @@ const curl_slist_ptr = koffi.pointer("void");
 const curl_mime_ptr = koffi.pointer("void");
 const curl_mimepart_ptr = koffi.pointer("void");
 
-// Struct for curl_multi_info_read result
-// Note: On 64-bit systems, there is padding after msg to align easy_handle
-// The data union contains both void* and CURLcode - we use void* for correct alignment
+// curl_multi_info_read returns this native struct. Let Koffi calculate pointer alignment
+// and union size instead of assuming the 64-bit, little-endian 24-byte layout.
+const CURLMsgData = koffi.union(`CURLMsgData_${koffiTypeSuffix}`, {
+  whatever: "void *",
+  result: "int",
+});
 const CURLMsg = koffi.struct(`CURLMsg_${koffiTypeSuffix}`, {
   msg: "int",
-  _pad: "int",           // 4 bytes padding for 64-bit alignment
-  easy_handle: "void *", // 8 bytes
-  data: "void *",        // Union as void* for proper 64-bit alignment (result is in low 4 bytes)
+  easy_handle: "void *",
+  data: CURLMsgData,
 });
 
 // WebSocket frame metadata struct
@@ -296,27 +298,17 @@ function curl_multi_info_read(
     return { message: null, msgsInQueue: msgsInQueue[0] };
   }
 
-  // Decode the raw bytes to get the result as an integer
-  // CURLMsg layout: int msg (4) + int pad (4) + void* easy_handle (8) + union data (8)
-  const rawBytes = koffi.decode(msgPtr, koffi.array("uint8", 24)) as number[];
-  const buffer = Buffer.from(rawBytes);
-
-  const msgType = buffer.readInt32LE(0);
-  const result = buffer.readInt32LE(16); // Result is at offset 16 (first 4 bytes of union)
-
-  // Decode the struct to get the easy_handle pointer
   const msg = koffi.decode(msgPtr, CURLMsg) as {
     msg: number;
-    _pad: number;
     easy_handle: unknown;
-    data: unknown;
+    data: { result: number };
   };
 
   return {
     message: {
-      msg: msgType,
+      msg: msg.msg,
       easyHandle: msg.easy_handle,
-      result: result,
+      result: msg.data.result,
     },
     msgsInQueue: msgsInQueue[0],
   };
